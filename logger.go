@@ -92,6 +92,10 @@ func (defaultLogger) Info(msg string, args ...any)  { slog.Info(msg, args...) }
 func (defaultLogger) Warn(msg string, args ...any)  { slog.Warn(msg, args...) }
 func (defaultLogger) Error(msg string, args ...any) { slog.Error(msg, args...) }
 
+// DefaultLogger is the Logger used when none is supplied. It delegates to the
+// log/slog default logger.
+var DefaultLogger Logger = defaultLogger{}
+
 // loggerAdapter wraps a Logger and satisfies the goaktlog.Logger interface
 // used internally by the underlying engine.
 type loggerAdapter struct {

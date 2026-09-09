@@ -74,7 +74,7 @@ type Config struct {
 func NewConfig(eventsStore persistence.EventsStore, opts ...Option) *Config {
 	c := &Config{
 		eventsStore: eventsStore,
-		logger:      defaultLogger{},
+		logger:      DefaultLogger,
 		eventStream: eventstream.New(),
 	}
 
@@ -83,7 +83,7 @@ func NewConfig(eventsStore persistence.EventsStore, opts ...Option) *Config {
 	}
 
 	if isNilLogger(c.logger) {
-		c.logger = defaultLogger{}
+		c.logger = DefaultLogger
 	}
 	return c
 }
