@@ -864,6 +864,22 @@ func TestLoggerAdapterWithUsesFieldLogger(t *testing.T) {
 	assert.Equal(t, []any{"component", "runtime", "tenant", "t1"}, native.sink.lastFields)
 }
 
+func TestResolveLogger(t *testing.T) {
+	t.Run("returns the logger when it is usable", func(t *testing.T) {
+		spy := &spyLogger{}
+		assert.Same(t, spy, ResolveLogger(spy))
+	})
+
+	t.Run("returns DefaultLogger for an untyped nil", func(t *testing.T) {
+		assert.Equal(t, DefaultLogger, ResolveLogger(nil))
+	})
+
+	t.Run("returns DefaultLogger for a typed nil", func(t *testing.T) {
+		var typedNil *spyLogger
+		assert.Equal(t, DefaultLogger, ResolveLogger(typedNil))
+	})
+}
+
 func TestWithFields(t *testing.T) {
 	t.Run("empty args returns the same logger", func(t *testing.T) {
 		spy := &spyLogger{}

@@ -214,6 +214,17 @@ func isNilLogger(l Logger) bool {
 	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
+// ResolveLogger returns logger when it is usable, and DefaultLogger when it is
+// nil or a typed-nil pointer. It lets packages outside the root apply the same
+// nil-logger semantics the engine uses, without each of them re-implementing
+// the typed-nil detection.
+func ResolveLogger(logger Logger) Logger {
+	if isNilLogger(logger) {
+		return DefaultLogger
+	}
+	return logger
+}
+
 // levelSeverity maps a goaktlog.Level to an integer severity for comparison.
 // Lower values are more verbose. GoAkt's level enum has non-standard ordering
 // (Debug=5 in the iota) so direct numeric comparison does not reflect severity.

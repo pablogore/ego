@@ -62,6 +62,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   **This is a visible behaviour change.** A `Logger` that implements neither optional interface will now receive engine DEBUG records it previously never saw. Implement `EnabledLogger` (or `LeveledLogger`) to gate them, or filter inside the logger.
 
+- **`migration.WithLogger(nil)` no longer panics.** The migrator stored whatever the option supplied, so a nil — or a typed-nil such as `(*myLogger)(nil)` — replaced the default and the first log call inside `Run` dereferenced it. `migration.New` now resolves the logger after applying every option, so a nil or typed-nil logger falls back to `ego.DefaultLogger`, the same semantics the engine already applied to `ego.WithLogger`. The new `ego.ResolveLogger` helper exposes that single rule to packages outside the root instead of each one re-implementing typed-nil detection.
+
 ## [v4.4.3] - 2026-08-15
 
 ### 💥 Breaking Changes

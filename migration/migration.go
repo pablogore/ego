@@ -80,6 +80,9 @@ func New(eventsStore persistence.EventsStore, snapshotStore persistence.Snapshot
 	for _, opt := range opts {
 		opt.apply(m)
 	}
+	// Options may have set a nil or typed-nil logger, which would panic on the
+	// first log call. Resolving after the loop covers every option path.
+	m.logger = ego.ResolveLogger(m.logger)
 	return m
 }
 
