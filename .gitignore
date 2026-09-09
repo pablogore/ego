@@ -18,3 +18,7 @@ gen/
 .config/
 *.out
 .local/
+
+# Local tooling caches (code index, skill registry)
+.codegraph/
+.atl/
