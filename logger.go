@@ -154,7 +154,15 @@ type loggerAdapter struct {
 	ctxLog  ContextLogger
 	fielder FieldLogger
 
-	fields []any // accumulated key-value pairs from With()
+	// backend is inner with Ego's own wrappers removed — the Logger every
+	// record is routed to. It is what the capability assertions above were
+	// resolved against, so one consistent target serves both the context-free
+	// and the context-bearing paths.
+	backend Logger
+
+	// fields are the key-value pairs replayed on every record: the fields the
+	// unwrapped wrappers contribute, followed by those accumulated from With().
+	fields []any
 }
 
 // compile-time check
@@ -163,12 +171,62 @@ var _ log.Logger = (*loggerAdapter)(nil)
 // newLoggerAdapter creates a loggerAdapter wrapping the given Logger and
 // resolves which optional capability interfaces it implements.
 func newLoggerAdapter(inner Logger) *loggerAdapter {
-	a := &loggerAdapter{inner: inner}
-	a.enabled, _ = inner.(EnabledLogger)
-	a.leveled, _ = inner.(LeveledLogger)
-	a.ctxLog, _ = inner.(ContextLogger)
+	// Ego's own wrappers do not implement the capability interfaces on behalf of
+	// what they wrap, so capabilities are resolved against the backend the
+	// wrappers sit in front of. The fields those wrappers contribute come back
+	// with it, because routing straight to the backend bypasses them.
+	backend, fields := unwrapLogger(inner)
+	a := &loggerAdapter{inner: inner, backend: backend, fields: fields}
+	a.enabled, _ = backend.(EnabledLogger)
+	a.leveled, _ = backend.(LeveledLogger)
+	a.ctxLog, _ = backend.(ContextLogger)
+	// With() must build on the current wrapper, not the backend, otherwise the
+	// wrapper's own fields are lost from the child logger.
 	a.fielder, _ = inner.(FieldLogger)
 	return a
+}
+
+// maxLoggerUnwrapDepth caps the unwrap walk. fieldsLogger.With flattens chained
+// calls instead of nesting, so the real depth is one; the cap is a defense against
+// an accidentally cyclic internal wrapper.
+const maxLoggerUnwrapDepth = 16
+
+// loggerUnwrapper is the unexported protocol Ego's own Logger wrappers use to
+// expose the Logger they wrap, together with the fields they contribute to
+// every record. It is deliberately not exported: a public Unwrap would become
+// an extensibility contract this package would have to keep forever.
+type loggerUnwrapper interface {
+	unwrapLogger() (Logger, []any)
+}
+
+// unwrapLogger walks Ego's own logger wrappers down to the backend that
+// actually implements the capability interfaces, collecting the fields those
+// wrappers contribute so a caller routing straight to the backend still emits
+// them. Fields come back outermost-to-innermost, matching the order the wrapper
+// chain would have produced.
+//
+// Only Ego's own wrappers implement loggerUnwrapper, and a wrapper's entire
+// behaviour is prepending its fields, so routing to the returned backend with
+// the returned fields prepended is exactly equivalent to routing through the
+// chain. The walk stops on a nil or self-referential link and at the depth cap;
+// in every one of those cases the returned backend is a wrapper that still
+// prepends its own fields, so nothing is dropped or applied twice.
+func unwrapLogger(l Logger) (Logger, []any) {
+	var fields []any
+	current := l
+	for range maxLoggerUnwrapDepth {
+		u, ok := current.(loggerUnwrapper)
+		if !ok {
+			return current, fields
+		}
+		next, contributed := u.unwrapLogger()
+		if next == nil || next == current {
+			return current, fields
+		}
+		fields = append(fields, contributed...)
+		current = next
+	}
+	return current, fields
 }
 
 // goaktLevelsByVerbosity lists every goaktlog.Level from most to least
@@ -329,23 +387,25 @@ func (a *loggerAdapter) mergeFields(extra []any) []any {
 	return merged
 }
 
-// route sends one record to the inner Logger's context-free method for level.
+// route sends one record to the backend Logger's context-free method for
+// level. Every record — context-bearing or not — goes to the same backend, so
+// the accumulated wrapper fields are applied exactly once on either path.
 func (a *loggerAdapter) route(level log.Level, msg string, fields []any) {
 	switch level {
 	case log.DebugLevel:
-		a.inner.Debug(msg, fields...)
+		a.backend.Debug(msg, fields...)
 	case log.WarningLevel:
-		a.inner.Warn(msg, fields...)
+		a.backend.Warn(msg, fields...)
 	case log.ErrorLevel:
-		a.inner.Error(msg, fields...)
+		a.backend.Error(msg, fields...)
 	default:
-		a.inner.Info(msg, fields...)
+		a.backend.Info(msg, fields...)
 	}
 }
 
 // routeContext sends one record together with the caller's context. It is used
-// only on paths where GoAkt actually supplied a context: when the inner Logger
-// implements ContextLogger the context is forwarded verbatim, otherwise the
+// only on paths where GoAkt actually supplied a context: when the backend
+// Logger implements ContextLogger the context is forwarded verbatim, otherwise the
 // context-free method is used rather than dropping the record.
 func (a *loggerAdapter) routeContext(ctx context.Context, level log.Level, msg string, fields []any) {
 	if a.ctxLog == nil {
@@ -489,9 +549,10 @@ func (a *loggerAdapter) With(keyValues ...any) log.Logger {
 		return newLoggerAdapter(a.fielder.With(keyValues...))
 	}
 	child := newLoggerAdapter(a.inner)
-	child.fields = make([]any, 0, len(a.fields)+len(keyValues))
-	child.fields = append(child.fields, a.fields...)
-	child.fields = append(child.fields, keyValues...)
+	fields := make([]any, 0, len(a.fields)+len(keyValues))
+	fields = append(fields, a.fields...)
+	fields = append(fields, keyValues...)
+	child.fields = fields
 	return child
 }
 func (a *loggerAdapter) Flush() error { return nil }
@@ -515,10 +576,13 @@ func (w *loggerWriter) Write(p []byte) (int, error) {
 // available (FieldLogger) and otherwise wraps it, so a caller can build a
 // component-tagged logger without knowing which capabilities the backend has.
 //
-// The returned Logger forwards EnabledLogger, LeveledLogger and ContextLogger
-// behaviour of the wrapped Logger, so tagging fields never silently downgrades
-// level gating or context propagation. A nil or typed-nil Logger yields
-// DiscardLogger rather than a wrapper that panics on first use.
+// The returned Logger declares only Logger and FieldLogger when it is a
+// wrapper, so a type assertion for EnabledLogger, LeveledLogger or
+// ContextLogger reports what the backend really supports rather than what
+// wrapping added. Ego itself still resolves those capabilities on the wrapped
+// Logger, so tagging fields never downgrades level gating or context
+// propagation. A nil or typed-nil Logger yields DiscardLogger rather than a
+// wrapper that panics on first use.
 func WithFields(logger Logger, args ...any) Logger {
 	if isNilLogger(logger) {
 		return DiscardLogger
@@ -533,19 +597,21 @@ func WithFields(logger Logger, args ...any) Logger {
 }
 
 // fieldsLogger is the fallback used by WithFields for a Logger without native
-// child-logger support. It prepends its own fields to every record and mirrors
-// the wrapped Logger's optional capabilities.
+// child-logger support. Prepending its own fields to every record is its entire
+// behaviour; it claims none of the wrapped Logger's optional capabilities.
 type fieldsLogger struct {
 	inner  Logger
 	fields []any
 }
 
+// fieldsLogger declares only what it genuinely owns. Advertising the wrapped
+// Logger's optional interfaces would make `_, ok := logger.(ContextLogger)`
+// report a capability the backend may not have. Ego reaches the real
+// capabilities through unwrapLogger instead.
 var (
-	_ Logger        = (*fieldsLogger)(nil)
-	_ EnabledLogger = (*fieldsLogger)(nil)
-	_ LeveledLogger = (*fieldsLogger)(nil)
-	_ ContextLogger = (*fieldsLogger)(nil)
-	_ FieldLogger   = (*fieldsLogger)(nil)
+	_ Logger          = (*fieldsLogger)(nil)
+	_ FieldLogger     = (*fieldsLogger)(nil)
+	_ loggerUnwrapper = (*fieldsLogger)(nil)
 )
 
 // prepend returns this logger's fields followed by the record's own fields.
@@ -564,55 +630,10 @@ func (f *fieldsLogger) Info(msg string, args ...any)  { f.inner.Info(msg, f.prep
 func (f *fieldsLogger) Warn(msg string, args ...any)  { f.inner.Warn(msg, f.prepend(args)...) }
 func (f *fieldsLogger) Error(msg string, args ...any) { f.inner.Error(msg, f.prepend(args)...) }
 
-// Enabled defers to the wrapped Logger's own capability, in the same
-// precedence order the adapter uses, and stays permissive when it declares
-// neither.
-func (f *fieldsLogger) Enabled(ctx context.Context, level slog.Level) bool {
-	if el, ok := f.inner.(EnabledLogger); ok {
-		return el.Enabled(ctx, level)
-	}
-	if ll, ok := f.inner.(LeveledLogger); ok {
-		return level >= goaktToSlogLevel(parseLevel(ll.Level()))
-	}
-	return true
-}
-
-// Level reports the wrapped Logger's level, or "debug" when it declares none.
-func (f *fieldsLogger) Level() string {
-	if ll, ok := f.inner.(LeveledLogger); ok {
-		return ll.Level()
-	}
-	return levelDebug
-}
-
-func (f *fieldsLogger) DebugContext(ctx context.Context, msg string, args ...any) {
-	if cl, ok := f.inner.(ContextLogger); ok {
-		cl.DebugContext(ctx, msg, f.prepend(args)...)
-		return
-	}
-	f.Debug(msg, args...)
-}
-func (f *fieldsLogger) InfoContext(ctx context.Context, msg string, args ...any) {
-	if cl, ok := f.inner.(ContextLogger); ok {
-		cl.InfoContext(ctx, msg, f.prepend(args)...)
-		return
-	}
-	f.Info(msg, args...)
-}
-func (f *fieldsLogger) WarnContext(ctx context.Context, msg string, args ...any) {
-	if cl, ok := f.inner.(ContextLogger); ok {
-		cl.WarnContext(ctx, msg, f.prepend(args)...)
-		return
-	}
-	f.Warn(msg, args...)
-}
-func (f *fieldsLogger) ErrorContext(ctx context.Context, msg string, args ...any) {
-	if cl, ok := f.inner.(ContextLogger); ok {
-		cl.ErrorContext(ctx, msg, f.prepend(args)...)
-		return
-	}
-	f.Error(msg, args...)
-}
+// unwrapLogger exposes the wrapped Logger and the fields this wrapper
+// contributes, so Ego can resolve the backend's real capabilities and still
+// emit these fields when it routes there directly.
+func (f *fieldsLogger) unwrapLogger() (Logger, []any) { return f.inner, f.fields }
 
 // With flattens chained WithFields calls onto the same wrapped Logger instead
 // of nesting wrappers.

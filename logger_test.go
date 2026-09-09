@@ -917,60 +917,226 @@ func TestWithFields(t *testing.T) {
 		assert.Equal(t, []any{"component", "engine"}, spy.lastFields)
 	})
 
-	t.Run("wrapper honors the wrapped EnabledLogger", func(t *testing.T) {
-		inner := &enabledSpyLogger{min: slog.LevelWarn}
-		child := WithFields(inner, "component", "engine")
-
-		el, ok := child.(EnabledLogger)
-		require.True(t, ok, "wrapping must not drop EnabledLogger")
-		assert.False(t, el.Enabled(context.Background(), slog.LevelDebug))
-		assert.True(t, el.Enabled(context.Background(), slog.LevelError))
-
-		// The same must hold through the adapter, which is what gates GoAkt.
-		a := newLoggerAdapter(child)
-		assert.False(t, a.Enabled(log.DebugLevel))
-		assert.True(t, a.Enabled(log.ErrorLevel))
-	})
-
-	t.Run("wrapper honors the wrapped LeveledLogger", func(t *testing.T) {
-		child := WithFields(&leveledSpyLogger{level: levelError}, "component", "engine")
-
-		ll, ok := child.(LeveledLogger)
-		require.True(t, ok, "wrapping must not drop LeveledLogger")
-		assert.Equal(t, levelError, ll.Level())
-
-		a := newLoggerAdapter(child)
-		assert.False(t, a.Enabled(log.DebugLevel))
-		assert.True(t, a.Enabled(log.ErrorLevel))
-	})
-
-	t.Run("wrapper honors the wrapped ContextLogger", func(t *testing.T) {
-		ctx := context.WithValue(context.Background(), ctxKey{}, "trace-1")
-		inner := &ctxSpyLogger{}
-		child := WithFields(inner, "component", "engine")
-
-		newLoggerAdapter(child).InfoContext(ctx, "started", "k", "v")
-
-		require.Equal(t, 1, inner.ctxCalls, "wrapping must not drop context propagation")
-		assert.Equal(t, ctx, inner.lastCtx)
-		assert.Equal(t, "started", inner.lastMsg)
-		assert.Equal(t, []any{"component", "engine", "k", "v"}, inner.lastFields)
-	})
-
-	t.Run("wrapper stays permissive for a plain logger", func(t *testing.T) {
-		child := WithFields(&spyLogger{}, "component", "engine")
-		el, ok := child.(EnabledLogger)
-		require.True(t, ok)
-		assert.True(t, el.Enabled(context.Background(), slog.LevelDebug))
-		assert.Equal(t, levelDebug, child.(LeveledLogger).Level())
-		assert.True(t, newLoggerAdapter(child).Enabled(log.DebugLevel))
-	})
-
 	t.Run("chained calls flatten onto the same logger", func(t *testing.T) {
 		spy := &spyLogger{}
 		WithFields(WithFields(spy, "a", 1), "b", 2).Info("msg", "c", 3)
 		assert.Equal(t, []any{"a", 1, "b", 2, "c", 3}, spy.lastFields)
 	})
+}
+
+// -----------------------------------------------------------------------------
+// Honest capability reporting
+//
+// The wrapper WithFields returns for a Logger without native child-logger
+// support must advertise only what it truly owns: Logger and FieldLogger. A
+// consumer asking `_, ok := logger.(ContextLogger)` is asking whether the
+// backend understands context, and the answer must not be "yes, because
+// something wrapped it". Ego still finds the capability internally, through an
+// unexported unwrap protocol.
+// -----------------------------------------------------------------------------
+
+func TestWithFieldsWrapperReportsOnlyItsOwnCapabilities(t *testing.T) {
+	wrapped := WithFields(&ctxSpyLogger{}, "component", "runtime")
+
+	t.Run("does not advertise ContextLogger", func(t *testing.T) {
+		_, ok := wrapped.(ContextLogger)
+		require.False(t, ok, "the wrapper must not claim the backend's ContextLogger")
+	})
+
+	t.Run("does not advertise EnabledLogger", func(t *testing.T) {
+		_, ok := WithFields(&enabledSpyLogger{min: slog.LevelWarn}, "component", "runtime").(EnabledLogger)
+		require.False(t, ok, "the wrapper must not claim the backend's EnabledLogger")
+	})
+
+	t.Run("does not advertise LeveledLogger", func(t *testing.T) {
+		_, ok := WithFields(&leveledSpyLogger{level: levelError}, "component", "runtime").(LeveledLogger)
+		require.False(t, ok, "the wrapper must not claim the backend's LeveledLogger")
+	})
+
+	t.Run("still advertises Logger and FieldLogger", func(t *testing.T) {
+		_, ok := wrapped.(FieldLogger)
+		require.True(t, ok, "the wrapper owns field tagging, so it must declare FieldLogger")
+	})
+}
+
+func TestAdapterFindsCapabilitiesThroughTheWrapper(t *testing.T) {
+	t.Run("ContextLogger", func(t *testing.T) {
+		adapter := newLoggerAdapter(WithFields(&ctxSpyLogger{}, "component", "runtime"))
+		require.NotNil(t, adapter.ctxLog)
+	})
+
+	t.Run("EnabledLogger", func(t *testing.T) {
+		adapter := newLoggerAdapter(WithFields(&enabledSpyLogger{min: slog.LevelWarn}, "component", "runtime"))
+		require.NotNil(t, adapter.enabled)
+		assert.False(t, adapter.Enabled(log.DebugLevel))
+		assert.True(t, adapter.Enabled(log.ErrorLevel))
+	})
+
+	t.Run("LeveledLogger", func(t *testing.T) {
+		adapter := newLoggerAdapter(WithFields(&leveledSpyLogger{level: levelError}, "component", "runtime"))
+		require.NotNil(t, adapter.leveled)
+		assert.False(t, adapter.Enabled(log.DebugLevel))
+		assert.True(t, adapter.Enabled(log.ErrorLevel))
+	})
+
+	t.Run("FieldLogger resolves against the wrapper, not the backend", func(t *testing.T) {
+		adapter := newLoggerAdapter(WithFields(&spyLogger{}, "component", "runtime"))
+		require.NotNil(t, adapter.fielder,
+			"With() must operate on the current wrapper so its fields are kept")
+	})
+}
+
+// TestUnwrappedRoutePreservesWrapperFields is the core regression guard for the
+// unwrap protocol: routing straight to the backend must not skip the fields the
+// wrapper would have prepended.
+func TestUnwrappedRoutePreservesWrapperFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		call   func(*loggerAdapter, context.Context)
+		method string
+		msg    string
+		fields []any
+		ctxUse bool
+	}{
+		{"DebugContext", func(a *loggerAdapter, c context.Context) { a.DebugContext(c, "d") }, "debug", "d", []any{"component", "runtime"}, true},
+		{"DebugfContext", func(a *loggerAdapter, c context.Context) { a.DebugfContext(c, "d%d", 1) }, "debug", "d1", []any{"component", "runtime"}, true},
+		{"InfoContext", func(a *loggerAdapter, c context.Context) { a.InfoContext(c, "i") }, "info", "i", []any{"component", "runtime"}, true},
+		{"InfofContext", func(a *loggerAdapter, c context.Context) { a.InfofContext(c, "i%d", 2) }, "info", "i2", []any{"component", "runtime"}, true},
+		{"WarnContext", func(a *loggerAdapter, c context.Context) { a.WarnContext(c, "w") }, "warn", "w", []any{"component", "runtime"}, true},
+		{"WarnfContext", func(a *loggerAdapter, c context.Context) { a.WarnfContext(c, "w%d", 3) }, "warn", "w3", []any{"component", "runtime"}, true},
+		{"ErrorContext", func(a *loggerAdapter, c context.Context) { a.ErrorContext(c, "e") }, "error", "e", []any{"component", "runtime"}, true},
+		{"ErrorfContext", func(a *loggerAdapter, c context.Context) { a.ErrorfContext(c, "e%d", 4) }, "error", "e4", []any{"component", "runtime"}, true},
+		{"Debug", func(a *loggerAdapter, _ context.Context) { a.Debug("d") }, "debug", "d", []any{"component", "runtime"}, false},
+		{"Debugf", func(a *loggerAdapter, _ context.Context) { a.Debugf("d%d", 1) }, "debug", "d1", []any{"component", "runtime"}, false},
+		{"Info", func(a *loggerAdapter, _ context.Context) { a.Info("i") }, "info", "i", []any{"component", "runtime"}, false},
+		{"Infof", func(a *loggerAdapter, _ context.Context) { a.Infof("i%d", 2) }, "info", "i2", []any{"component", "runtime"}, false},
+		{"Warn", func(a *loggerAdapter, _ context.Context) { a.Warn("w") }, "warn", "w", []any{"component", "runtime"}, false},
+		{"Warnf", func(a *loggerAdapter, _ context.Context) { a.Warnf("w%d", 3) }, "warn", "w3", []any{"component", "runtime"}, false},
+		{"Error", func(a *loggerAdapter, _ context.Context) { a.Error("e") }, "error", "e", []any{"component", "runtime"}, false},
+		{"Errorf", func(a *loggerAdapter, _ context.Context) { a.Errorf("e%d", 4) }, "error", "e4", []any{"component", "runtime"}, false},
+		{
+			"InfoContext with record fields",
+			func(a *loggerAdapter, c context.Context) { a.InfoContext(c, "i", "k", "v") },
+			"info", "i", []any{"component", "runtime", "k", "v"}, true,
+		},
+		{
+			"Info with record fields",
+			func(a *loggerAdapter, _ context.Context) { a.Info("i", "k", "v") },
+			"info", "i", []any{"component", "runtime", "k", "v"}, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), ctxKey{}, "trace-1")
+			backend := &ctxSpyLogger{}
+			a := newLoggerAdapter(WithFields(backend, "component", "runtime"))
+
+			tt.call(a, ctx)
+
+			assert.Equal(t, tt.method, backend.lastMethod)
+			assert.Equal(t, tt.msg, backend.lastMsg)
+			assert.Equal(t, tt.fields, backend.lastFields,
+				"the wrapper's fields must survive routing to the unwrapped backend")
+
+			if tt.ctxUse {
+				require.Equal(t, 1, backend.ctxCalls, "a context-bearing call must reach the backend's *Context method")
+				assert.Equal(t, tt.method, backend.ctxMethod)
+				assert.Equal(t, ctx, backend.lastCtx, "the caller's context must round-trip verbatim")
+			} else {
+				assert.Equal(t, 0, backend.ctxCalls, "a context-free call must not fabricate a context")
+			}
+		})
+	}
+}
+
+func TestUnwrappedRouteAppliesWrapperFieldsExactlyOnce(t *testing.T) {
+	backend := &ctxSpyLogger{}
+	a := newLoggerAdapter(WithFields(backend, "component", "runtime"))
+
+	a.Info("plain")
+	assert.Equal(t, []any{"component", "runtime"}, backend.lastFields)
+
+	a.InfoContext(context.Background(), "ctx")
+	assert.Equal(t, []any{"component", "runtime"}, backend.lastFields,
+		"the context path must apply the wrapper's fields the same number of times as the plain path")
+}
+
+func TestUnwrappedRouteKeepsChildLoggerFieldOrder(t *testing.T) {
+	backend := &ctxSpyLogger{}
+	child := newLoggerAdapter(WithFields(backend, "component", "runtime")).With("tenant", "t1")
+
+	child.InfoContext(context.Background(), "started", "attempt", 2)
+	assert.Equal(t, []any{"component", "runtime", "tenant", "t1", "attempt", 2}, backend.lastFields)
+}
+
+func TestWithFieldsWrapperAroundPlainLoggerStaysPermissive(t *testing.T) {
+	backend := &spyLogger{}
+	a := newLoggerAdapter(WithFields(backend, "component", "runtime"))
+
+	require.Nil(t, a.enabled)
+	require.Nil(t, a.leveled)
+	require.Nil(t, a.ctxLog)
+	for _, level := range goaktLevelsByVerbosity {
+		assert.True(t, a.Enabled(level), "level %v", level)
+	}
+	assert.Equal(t, log.DebugLevel, a.LogLevel())
+
+	a.InfoContext(context.Background(), "started", "k", "v")
+	assert.Equal(t, "info", backend.lastMethod)
+	assert.Equal(t, []any{"component", "runtime", "k", "v"}, backend.lastFields,
+		"a backend without ContextLogger must still receive the wrapper's fields")
+}
+
+// cyclicLogger implements the unexported unwrap protocol and always reports
+// itself, standing in for an accidentally self-referential wrapper.
+type cyclicLogger struct {
+	spyLogger
+	contributed []any
+}
+
+func (c *cyclicLogger) unwrapLogger() (Logger, []any) { return c, c.contributed }
+
+func TestUnwrapLoggerStopsOnSelfReference(t *testing.T) {
+	self := &cyclicLogger{contributed: []any{"a", 1}}
+	backend, fields := unwrapLogger(self)
+
+	assert.Same(t, self, backend, "a self-referential wrapper must be its own backend")
+	assert.Empty(t, fields,
+		"a wrapper that was not passed through must not have its fields collected twice")
+}
+
+// chainLogger implements the unwrap protocol by pointing at the next link, so a
+// test can build an arbitrarily deep chain.
+type chainLogger struct {
+	spyLogger
+	next  Logger
+	field any
+}
+
+func (c *chainLogger) unwrapLogger() (Logger, []any) { return c.next, []any{"link", c.field} }
+
+func TestUnwrapLoggerCapsDepth(t *testing.T) {
+	terminal := &spyLogger{}
+	var head Logger = terminal
+	// One more link than the guard allows, so the walk must stop early.
+	for i := maxLoggerUnwrapDepth; i >= 0; i-- {
+		head = &chainLogger{next: head, field: i}
+	}
+
+	backend, fields := unwrapLogger(head)
+
+	assert.NotSame(t, terminal, backend, "the depth guard must stop before the terminal logger")
+	assert.IsType(t, &chainLogger{}, backend)
+	assert.Len(t, fields, 2*maxLoggerUnwrapDepth,
+		"exactly the wrappers walked through contribute fields")
+}
+
+func TestUnwrapLoggerPassesThroughANonWrapper(t *testing.T) {
+	backend := &spyLogger{}
+	got, fields := unwrapLogger(backend)
+
+	assert.Same(t, backend, got)
+	assert.Empty(t, fields)
 }
 
 // -----------------------------------------------------------------------------
