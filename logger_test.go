@@ -526,3 +526,44 @@ func (*leveledNoopLogger) Info(_ string, _ ...any)  {}
 func (*leveledNoopLogger) Warn(_ string, _ ...any)  {}
 func (*leveledNoopLogger) Error(_ string, _ ...any) {}
 func (l *leveledNoopLogger) Level() string          { return l.level }
+
+// -----------------------------------------------------------------------------
+// Package-level defaults
+// -----------------------------------------------------------------------------
+
+func TestPackageLevelLoggerDefaults(t *testing.T) {
+	tests := []struct {
+		name   string
+		logger Logger
+	}{
+		{name: "DefaultLogger is set", logger: DefaultLogger},
+		{name: "DiscardLogger is set", logger: DiscardLogger},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NotNil(t, tt.logger)
+			assert.False(t, isNilLogger(tt.logger))
+		})
+	}
+
+	// DefaultLogger must actually log, so it cannot be the discarding one.
+	assert.NotEqual(t, DiscardLogger, DefaultLogger)
+	assert.IsType(t, defaultLogger{}, DefaultLogger)
+}
+
+func TestNewConfigUsesDefaultLoggerWhenNoneSupplied(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "no options at all", opts: nil},
+		{name: "explicit nil logger falls back", opts: []Option{WithLogger(nil)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig(nil, tt.opts...)
+			require.NotNil(t, cfg.logger)
+			assert.Equal(t, DefaultLogger, cfg.logger)
+		})
+	}
+}
