@@ -22,6 +22,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   cfg := &kafka.Config{Logger: myEgoLogger}
   ```
 
+### ✨ Features
+
+- **`ego.EnabledLogger` lets a Logger answer level checks exactly.** A `Logger` that implements it becomes the sole authority on log-level gating, so the engine stops inferring levels:
+
+  ```go
+  func (l *myLogger) Enabled(ctx context.Context, level slog.Level) bool {
+      return l.handler.Enabled(ctx, level)
+  }
+  ```
+
+  The signature mirrors `log/slog`'s own `Handler.Enabled`, so any slog-backed logger satisfies it trivially and gating costs no string formatting on the hot path. `LeveledLogger` keeps working unchanged and is used when `EnabledLogger` is absent.
+
+- **`DiscardLogger` now reports every level as disabled**, so the engine skips message formatting entirely for it, and **`DefaultLogger` answers level checks from `slog.Default()` on every call**, so gating tracks `slog.SetDefault` instead of a snapshot taken when the engine was configured.
+
+### 🐛 Bug Fixes
+
+- **A custom `ego.Logger` no longer loses all engine DEBUG output.** The logger adapter used to snapshot the log level once, when the engine was configured, and to assume `info` for any `Logger` that did not implement `LeveledLogger` — including `ego.DefaultLogger`. The engine guards every DEBUG record with a level check, so those records were dropped before reaching the logger, no matter how the logger itself was configured.
+
+  The level is now resolved per call: `EnabledLogger` first, then `LeveledLogger` re-read on every check so a runtime level change is honored, and otherwise permissive — the adapter no longer filters on behalf of a `Logger` that never declared a level.
+
+  **This is a visible behaviour change.** A `Logger` that implements neither optional interface will now receive engine DEBUG records it previously never saw. Implement `EnabledLogger` (or `LeveledLogger`) to gate them, or filter inside the logger.
+
 ## [v4.4.3] - 2026-08-15
 
 ### 💥 Breaking Changes

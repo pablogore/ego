@@ -24,6 +24,8 @@ package ego
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -224,9 +226,11 @@ func TestLoggerAdapterErrorfContext(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestLoggerAdapterLogLevel(t *testing.T) {
-	t.Run("defaults to InfoLevel without LeveledLogger", func(t *testing.T) {
+	// A Logger that declares no level is not filtered by the adapter: reporting
+	// InfoLevel here is what silently dropped every GoAkt DEBUG record.
+	t.Run("reports DebugLevel when no capability interface is implemented", func(t *testing.T) {
 		a := newAdapter(&spyLogger{})
-		assert.Equal(t, log.InfoLevel, a.LogLevel())
+		assert.Equal(t, log.DebugLevel, a.LogLevel())
 	})
 
 	t.Run("uses LeveledLogger level when implemented", func(t *testing.T) {
@@ -241,9 +245,9 @@ func TestLoggerAdapterLogLevel(t *testing.T) {
 }
 
 func TestLoggerAdapterEnabled(t *testing.T) {
-	t.Run("default InfoLevel gates debug but allows info and above", func(t *testing.T) {
+	t.Run("no capability interface enables every level", func(t *testing.T) {
 		a := newAdapter(&spyLogger{})
-		assert.False(t, a.Enabled(log.DebugLevel))
+		assert.True(t, a.Enabled(log.DebugLevel))
 		assert.True(t, a.Enabled(log.InfoLevel))
 		assert.True(t, a.Enabled(log.WarningLevel))
 		assert.True(t, a.Enabled(log.ErrorLevel))
@@ -565,5 +569,180 @@ func TestNewConfigUsesDefaultLoggerWhenNoneSupplied(t *testing.T) {
 			require.NotNil(t, cfg.logger)
 			assert.Equal(t, DefaultLogger, cfg.logger)
 		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Capability interfaces — level gating (D1)
+// -----------------------------------------------------------------------------
+
+// mutableLeveledLogger returns a different level on every Level() call so a
+// test can prove the adapter re-reads the level instead of caching it.
+type mutableLeveledLogger struct {
+	spyLogger
+	levels []string
+	calls  int
+}
+
+func (m *mutableLeveledLogger) Level() string {
+	level := m.levels[min(m.calls, len(m.levels)-1)]
+	m.calls++
+	return level
+}
+
+// enabledSpyLogger implements Logger and EnabledLogger. It answers level
+// checks from a minimum slog.Level and records the context it was handed.
+type enabledSpyLogger struct {
+	spyLogger
+	min     slog.Level
+	lastCtx context.Context
+	calls   int
+}
+
+func (e *enabledSpyLogger) Enabled(ctx context.Context, level slog.Level) bool {
+	e.lastCtx = ctx
+	e.calls++
+	return level >= e.min
+}
+
+// enabledAndLeveledLogger implements both capability interfaces with
+// deliberately contradictory answers so precedence is observable.
+type enabledAndLeveledLogger struct {
+	enabledSpyLogger
+}
+
+func (enabledAndLeveledLogger) Level() string { return levelError }
+
+func TestGoaktDebugSurvivesLoggerWithoutCapabilities(t *testing.T) {
+	// GoAkt guards every DEBUG emission with `if logger.Enabled(log.DebugLevel)`
+	// (see goakt actor/death_watch.go). A Logger that declares no level must not
+	// be gated by the adapter, otherwise GoAkt drops DEBUG output entirely.
+	spy := &spyLogger{}
+	a := newLoggerAdapter(spy)
+
+	require.True(t, a.Enabled(log.DebugLevel),
+		"a Logger declaring no level must not have DEBUG filtered by the adapter")
+	assert.Equal(t, log.DebugLevel, a.LogLevel())
+
+	if a.Enabled(log.DebugLevel) { // exactly GoAkt's guard
+		a.Debug("actor stopped", "actor", "a1")
+	}
+	assert.Equal(t, "debug", spy.lastMethod)
+	assert.Equal(t, "actor stopped", spy.lastMsg)
+	assert.Equal(t, []any{"actor", "a1"}, spy.lastFields)
+}
+
+func TestLoggerAdapterRereadsLeveledLoggerPerCall(t *testing.T) {
+	inner := &mutableLeveledLogger{levels: []string{levelError, levelDebug}}
+	a := newLoggerAdapter(inner)
+
+	assert.False(t, a.Enabled(log.DebugLevel), "first check sees the error level")
+	assert.True(t, a.Enabled(log.DebugLevel), "second check must see the new debug level")
+	assert.Equal(t, log.DebugLevel, a.LogLevel(), "LogLevel must also be re-read")
+}
+
+func TestEnabledLoggerTakesPrecedenceOverLeveledLogger(t *testing.T) {
+	inner := &enabledAndLeveledLogger{}
+	inner.min = slog.LevelDebug // permits debug; Level() says "error"
+	a := newLoggerAdapter(inner)
+
+	assert.True(t, a.Enabled(log.DebugLevel), "EnabledLogger must win over LeveledLogger")
+	assert.Equal(t, log.DebugLevel, a.LogLevel())
+	assert.Positive(t, inner.calls, "EnabledLogger must actually be consulted")
+}
+
+func TestEnabledLoggerReceivesContext(t *testing.T) {
+	inner := &enabledSpyLogger{min: slog.LevelDebug}
+	a := newLoggerAdapter(inner)
+
+	a.Enabled(log.DebugLevel)
+	assert.Equal(t, context.Background(), inner.lastCtx,
+		"GoAkt's Enabled carries no context, so the adapter passes Background")
+}
+
+func TestDiscardLoggerDisablesEveryLevel(t *testing.T) {
+	el, ok := DiscardLogger.(EnabledLogger)
+	require.True(t, ok, "DiscardLogger must declare EnabledLogger")
+
+	for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		assert.False(t, el.Enabled(context.Background(), level), "level %v", level)
+	}
+
+	a := newLoggerAdapter(DiscardLogger)
+	for _, level := range []log.Level{log.DebugLevel, log.InfoLevel, log.WarningLevel, log.ErrorLevel, log.FatalLevel, log.PanicLevel} {
+		assert.False(t, a.Enabled(level), "level %v", level)
+	}
+	assert.Equal(t, log.InvalidLevel, a.LogLevel())
+}
+
+func TestDefaultLoggerAnswersFromSlog(t *testing.T) {
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	a := newLoggerAdapter(DefaultLogger)
+	assert.False(t, a.Enabled(log.DebugLevel))
+	assert.False(t, a.Enabled(log.InfoLevel))
+	assert.True(t, a.Enabled(log.WarningLevel))
+	assert.True(t, a.Enabled(log.ErrorLevel))
+	assert.Equal(t, log.WarningLevel, a.LogLevel())
+
+	// Same adapter, new default: the level must be re-read, never cached.
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	assert.True(t, a.Enabled(log.DebugLevel))
+	assert.Equal(t, log.DebugLevel, a.LogLevel())
+}
+
+func TestGoaktToSlogLevel(t *testing.T) {
+	tests := []struct {
+		name string
+		in   log.Level
+		want slog.Level
+	}{
+		{"debug", log.DebugLevel, slog.LevelDebug},
+		{"info", log.InfoLevel, slog.LevelInfo},
+		{"warning", log.WarningLevel, slog.LevelWarn},
+		{"error", log.ErrorLevel, slog.LevelError},
+		{"fatal is above error", log.FatalLevel, slog.LevelError + 4},
+		{"panic is above fatal", log.PanicLevel, slog.LevelError + 8},
+		{"invalid falls back to info", log.InvalidLevel, slog.LevelInfo},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, goaktToSlogLevel(tt.in))
+		})
+	}
+}
+
+func TestFormattedMethodsSkipFormattingWhenLevelDisabled(t *testing.T) {
+	inner := &enabledSpyLogger{min: slog.LevelError}
+	a := newLoggerAdapter(inner)
+
+	a.Debugf("expensive %s", "debug")
+	a.Infof("expensive %s", "info")
+	assert.Empty(t, inner.lastMethod, "disabled levels must not reach the inner logger")
+
+	a.Errorf("boom %s", "now")
+	assert.Equal(t, "error", inner.lastMethod)
+	assert.Equal(t, "boom now", inner.lastMsg)
+}
+
+// -----------------------------------------------------------------------------
+// Benchmarks — a disabled level must not pay for message formatting
+// -----------------------------------------------------------------------------
+
+func BenchmarkLoggerAdapterDebugfDisabled(b *testing.B) {
+	a := newLoggerAdapter(DiscardLogger) // EnabledLogger reporting false
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		a.Debugf("processing entity %s at offset %d", "entity-1", i)
+	}
+}
+
+func BenchmarkLoggerAdapterDebugfEnabled(b *testing.B) {
+	a := newLoggerAdapter(noopLogger{}) // no capabilities, so permissive
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		a.Debugf("processing entity %s at offset %d", "entity-1", i)
 	}
 }

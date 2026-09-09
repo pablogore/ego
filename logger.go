@@ -70,6 +70,20 @@ type LeveledLogger interface {
 	Level() string
 }
 
+// EnabledLogger is an optional interface that a Logger can implement to answer
+// level checks directly, instead of the adapter inferring them from a level
+// name. When the inner Logger implements this interface it is the sole
+// authority on gating: the adapter never second-guesses it.
+//
+// The signature mirrors log/slog's own Handler.Enabled, so any slog-backed
+// logger satisfies it trivially, and slog.Level is a typed integer, so gating
+// costs no string formatting or parsing on the hot path. The context is the one
+// the log call carries, which lets a backend make context-sensitive gating
+// decisions.
+type EnabledLogger interface {
+	Enabled(ctx context.Context, level slog.Level) bool
+}
+
 // discardLogger is a Logger that silently discards all log output.
 type discardLogger struct{}
 
@@ -77,6 +91,10 @@ func (discardLogger) Debug(string, ...any) {}
 func (discardLogger) Info(string, ...any)  {}
 func (discardLogger) Warn(string, ...any)  {}
 func (discardLogger) Error(string, ...any) {}
+
+// Enabled reports every level as disabled so that callers — the engine
+// included — skip message formatting entirely for a discarded logger.
+func (discardLogger) Enabled(context.Context, slog.Level) bool { return false }
 
 // DiscardLogger is a Logger that silently discards all log output.
 // It is useful in tests or when logging is not desired.
@@ -92,6 +110,13 @@ func (defaultLogger) Info(msg string, args ...any)  { slog.Info(msg, args...) }
 func (defaultLogger) Warn(msg string, args ...any)  { slog.Warn(msg, args...) }
 func (defaultLogger) Error(msg string, args ...any) { slog.Error(msg, args...) }
 
+// Enabled asks the log/slog default logger for the truth on every call, so the
+// engine's gating tracks slog.SetDefault instead of a construction-time
+// snapshot.
+func (defaultLogger) Enabled(ctx context.Context, level slog.Level) bool {
+	return slog.Default().Enabled(ctx, level)
+}
+
 // DefaultLogger is the Logger used when none is supplied. It delegates to the
 // log/slog default logger.
 var DefaultLogger Logger = defaultLogger{}
@@ -99,23 +124,59 @@ var DefaultLogger Logger = defaultLogger{}
 // loggerAdapter wraps a Logger and satisfies the goaktlog.Logger interface
 // used internally by the underlying engine.
 type loggerAdapter struct {
-	inner  Logger
-	level  log.Level
+	inner Logger
+
+	// Capability assertions, resolved once: the dynamic type of inner cannot
+	// change, so the assertions are cached even though the level value they
+	// report never is.
+	enabled EnabledLogger
+	leveled LeveledLogger
+
 	fields []any // accumulated key-value pairs from With()
 }
 
 // compile-time check
 var _ log.Logger = (*loggerAdapter)(nil)
 
-// newLoggerAdapter creates a loggerAdapter wrapping the given Logger. If the
-// Logger also implements LeveledLogger, the adapter uses its level for
-// engine-side gating; otherwise it defaults to InfoLevel.
+// newLoggerAdapter creates a loggerAdapter wrapping the given Logger and
+// resolves which optional capability interfaces it implements.
 func newLoggerAdapter(inner Logger) *loggerAdapter {
-	level := log.InfoLevel
-	if ll, ok := inner.(LeveledLogger); ok {
-		level = parseLevel(ll.Level())
+	a := &loggerAdapter{inner: inner}
+	a.enabled, _ = inner.(EnabledLogger)
+	a.leveled, _ = inner.(LeveledLogger)
+	return a
+}
+
+// goaktLevelsByVerbosity lists every goaktlog.Level from most to least
+// verbose. LogLevel walks it to report the most verbose enabled level.
+var goaktLevelsByVerbosity = []log.Level{
+	log.DebugLevel,
+	log.InfoLevel,
+	log.WarningLevel,
+	log.ErrorLevel,
+	log.FatalLevel,
+	log.PanicLevel,
+}
+
+// enabledAt resolves the level check for the given context, per call, in
+// capability precedence order:
+//
+//  1. EnabledLogger — the inner Logger answers exactly, no inference.
+//  2. LeveledLogger — Level() is read on every check, so a runtime level
+//     change is honored instead of being snapshotted at construction.
+//  3. Neither — permissive. The adapter must not filter on behalf of a Logger
+//     that never declared a level; the inner Logger does its own filtering,
+//     and guessing InfoLevel is exactly what silently dropped every DEBUG
+//     record the engine produced.
+func (a *loggerAdapter) enabledAt(ctx context.Context, l log.Level) bool {
+	switch {
+	case a.enabled != nil:
+		return a.enabled.Enabled(ctx, goaktToSlogLevel(l))
+	case a.leveled != nil:
+		return levelSeverity(l) >= levelSeverity(parseLevel(a.leveled.Level()))
+	default:
+		return true
 	}
-	return &loggerAdapter{inner: inner, level: level}
 }
 
 // isNilLogger returns true when l is nil or a typed-nil (e.g. (*MyLogger)(nil)).
@@ -148,6 +209,30 @@ func levelSeverity(l log.Level) int {
 		return 5
 	default:
 		return 1
+	}
+}
+
+// goaktToSlogLevel maps a goaktlog.Level to the slog.Level an EnabledLogger is
+// asked about. GoAkt's level enum has non-standard ordering (DebugLevel is the
+// last iota value), so the mapping is explicit rather than a numeric cast.
+// Fatal and Panic sit above Error to keep the result strictly monotonic in
+// severity, which lets LogLevel probe levels in verbosity order.
+func goaktToSlogLevel(l log.Level) slog.Level {
+	switch l {
+	case log.DebugLevel:
+		return slog.LevelDebug
+	case log.InfoLevel:
+		return slog.LevelInfo
+	case log.WarningLevel:
+		return slog.LevelWarn
+	case log.ErrorLevel:
+		return slog.LevelError
+	case log.FatalLevel:
+		return slog.LevelError + 4
+	case log.PanicLevel:
+		return slog.LevelError + 8
+	default:
+		return slog.LevelInfo
 	}
 }
 
@@ -209,63 +294,143 @@ func (a *loggerAdapter) mergeFields(extra []any) []any {
 	return merged
 }
 
+// route sends one record to the inner Logger's context-free method for level.
+func (a *loggerAdapter) route(level log.Level, msg string, fields []any) {
+	switch level {
+	case log.DebugLevel:
+		a.inner.Debug(msg, fields...)
+	case log.WarningLevel:
+		a.inner.Warn(msg, fields...)
+	case log.ErrorLevel:
+		a.inner.Error(msg, fields...)
+	default:
+		a.inner.Info(msg, fields...)
+	}
+}
+
+// The plain methods do not re-check the level: GoAkt already guards its call
+// sites with Enabled, and the inner Logger applies its own filtering. The
+// formatted methods do check, because the fmt.Sprintf allocation is one this
+// adapter would otherwise pay for a record nobody will emit.
+
 func (a *loggerAdapter) Debug(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.inner.Debug(msg, a.mergeFields(fields)...)
+	a.route(log.DebugLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) Debugf(format string, args ...any) {
-	a.inner.Debug(fmt.Sprintf(format, args...), a.fields...)
+	if !a.enabledAt(context.Background(), log.DebugLevel) {
+		return
+	}
+	a.route(log.DebugLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) DebugContext(_ context.Context, args ...any) { a.Debug(args...) }
-func (a *loggerAdapter) DebugfContext(_ context.Context, format string, args ...any) {
-	a.Debugf(format, args...)
+func (a *loggerAdapter) DebugContext(_ context.Context, args ...any) {
+	msg, fields := goaktArgsToMsg(args)
+	a.route(log.DebugLevel, msg, a.mergeFields(fields))
+}
+func (a *loggerAdapter) DebugfContext(ctx context.Context, format string, args ...any) {
+	if !a.enabledAt(ctx, log.DebugLevel) {
+		return
+	}
+	a.route(log.DebugLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Info(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.inner.Info(msg, a.mergeFields(fields)...)
+	a.route(log.InfoLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) Infof(format string, args ...any) {
-	a.inner.Info(fmt.Sprintf(format, args...), a.fields...)
+	if !a.enabledAt(context.Background(), log.InfoLevel) {
+		return
+	}
+	a.route(log.InfoLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) InfoContext(_ context.Context, args ...any) { a.Info(args...) }
-func (a *loggerAdapter) InfofContext(_ context.Context, format string, args ...any) {
-	a.Infof(format, args...)
+func (a *loggerAdapter) InfoContext(_ context.Context, args ...any) {
+	msg, fields := goaktArgsToMsg(args)
+	a.route(log.InfoLevel, msg, a.mergeFields(fields))
+}
+func (a *loggerAdapter) InfofContext(ctx context.Context, format string, args ...any) {
+	if !a.enabledAt(ctx, log.InfoLevel) {
+		return
+	}
+	a.route(log.InfoLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Warn(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.inner.Warn(msg, a.mergeFields(fields)...)
+	a.route(log.WarningLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) Warnf(format string, args ...any) {
-	a.inner.Warn(fmt.Sprintf(format, args...), a.fields...)
+	if !a.enabledAt(context.Background(), log.WarningLevel) {
+		return
+	}
+	a.route(log.WarningLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) WarnContext(_ context.Context, args ...any) { a.Warn(args...) }
-func (a *loggerAdapter) WarnfContext(_ context.Context, format string, args ...any) {
-	a.Warnf(format, args...)
+func (a *loggerAdapter) WarnContext(_ context.Context, args ...any) {
+	msg, fields := goaktArgsToMsg(args)
+	a.route(log.WarningLevel, msg, a.mergeFields(fields))
+}
+func (a *loggerAdapter) WarnfContext(ctx context.Context, format string, args ...any) {
+	if !a.enabledAt(ctx, log.WarningLevel) {
+		return
+	}
+	a.route(log.WarningLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Error(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.inner.Error(msg, a.mergeFields(fields)...)
+	a.route(log.ErrorLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) Errorf(format string, args ...any) {
-	a.inner.Error(fmt.Sprintf(format, args...), a.fields...)
+	if !a.enabledAt(context.Background(), log.ErrorLevel) {
+		return
+	}
+	a.route(log.ErrorLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) ErrorContext(_ context.Context, args ...any) { a.Error(args...) }
-func (a *loggerAdapter) ErrorfContext(_ context.Context, format string, args ...any) {
-	a.Errorf(format, args...)
+func (a *loggerAdapter) ErrorContext(_ context.Context, args ...any) {
+	msg, fields := goaktArgsToMsg(args)
+	a.route(log.ErrorLevel, msg, a.mergeFields(fields))
+}
+func (a *loggerAdapter) ErrorfContext(ctx context.Context, format string, args ...any) {
+	if !a.enabledAt(ctx, log.ErrorLevel) {
+		return
+	}
+	a.route(log.ErrorLevel, fmt.Sprintf(format, args...), a.fields)
 }
 
-func (a *loggerAdapter) LogLevel() log.Level { return a.level }
-func (a *loggerAdapter) Enabled(l log.Level) bool {
-	return levelSeverity(l) >= levelSeverity(a.level)
+// LogLevel reports the most verbose level the inner Logger currently accepts.
+// It is resolved per call, never cached. When the Logger enables nothing —
+// DiscardLogger, for instance — the result is InvalidLevel, matching what
+// GoAkt's own Zap adapter reports for an unmappable level.
+func (a *loggerAdapter) LogLevel() log.Level {
+	switch {
+	case a.enabled != nil:
+		for _, l := range goaktLevelsByVerbosity {
+			if a.enabled.Enabled(context.Background(), goaktToSlogLevel(l)) {
+				return l
+			}
+		}
+		return log.InvalidLevel
+	case a.leveled != nil:
+		return parseLevel(a.leveled.Level())
+	default:
+		return log.DebugLevel
+	}
 }
+
+// Enabled reports whether the inner Logger accepts the given level. GoAkt's
+// Logger interface carries no context here, so Background is used; the
+// *Context methods forward the caller's real context instead.
+func (a *loggerAdapter) Enabled(l log.Level) bool {
+	return a.enabledAt(context.Background(), l)
+}
+
+// With returns a child logger carrying the given key-value pairs.
 func (a *loggerAdapter) With(keyValues ...any) log.Logger {
 	if len(keyValues) == 0 {
 		return a
 	}
-	merged := make([]any, 0, len(a.fields)+len(keyValues))
-	merged = append(merged, a.fields...)
-	merged = append(merged, keyValues...)
-	return &loggerAdapter{inner: a.inner, level: a.level, fields: merged}
+	child := newLoggerAdapter(a.inner)
+	child.fields = make([]any, 0, len(a.fields)+len(keyValues))
+	child.fields = append(child.fields, a.fields...)
+	child.fields = append(child.fields, keyValues...)
+	return child
 }
 func (a *loggerAdapter) Flush() error { return nil }
 
