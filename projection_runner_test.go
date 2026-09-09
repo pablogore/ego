@@ -1922,3 +1922,23 @@ func TestRunnerPullEfficiency(t *testing.T) {
 		require.NoError(t, runner.Stop())
 	})
 }
+
+// -----------------------------------------------------------------------------
+// Default logger
+// -----------------------------------------------------------------------------
+
+func TestProjectionRunnerDefaultLoggerComesFromEgoSeam(t *testing.T) {
+	t.Run("no withLogger option yields a loggerAdapter over Ego's seam", func(t *testing.T) {
+		runner := newProjectionRunner("projection-name", testHandler1{}, nil, nil)
+		require.NotNil(t, runner.logger)
+		// The default must be derived from Ego's own Logger seam, never a
+		// concrete third-party logger constructed by first-party code.
+		assert.IsType(t, &loggerAdapter{}, runner.logger)
+	})
+
+	t.Run("withLogger overrides the default", func(t *testing.T) {
+		custom := newLoggerAdapter(&spyLogger{})
+		runner := newProjectionRunner("projection-name", testHandler1{}, nil, nil, withLogger(custom))
+		assert.Same(t, custom, runner.logger)
+	})
+}

@@ -26,7 +26,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -178,7 +177,7 @@ func newProjectionRunner(name string,
 	opts ...runnerOption) *projectionRunner {
 	runner := &projectionRunner{
 		name:             name,
-		logger:           log.NewZap(log.ErrorLevel, os.Stderr),
+		logger:           newLoggerAdapter(DiscardLogger),
 		handler:          handler,
 		eventsStore:      eventsStore,
 		offsetsStore:     offsetStore,
