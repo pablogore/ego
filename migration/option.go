@@ -22,7 +22,7 @@
 
 package migration
 
-import "github.com/tochemey/goakt/v4/log"
+import ego "github.com/tochemey/ego/v4"
 
 // Option configures the Migrator.
 type Option interface {
@@ -42,8 +42,10 @@ func WithPageSize(size uint64) Option {
 	})
 }
 
-// WithLogger sets the logger used during migration.
-func WithLogger(logger log.Logger) Option {
+// WithLogger sets the logger used during migration. It accepts any
+// ego.Logger implementation, the same logging seam the engine uses.
+// When unset, the migrator logs through ego.DefaultLogger.
+func WithLogger(logger ego.Logger) Option {
 	return optionFunc(func(m *Migrator) {
 		m.logger = logger
 	})

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### 💥 Breaking Changes
+
+- **`migration.WithLogger` now takes `ego.Logger` instead of `github.com/tochemey/goakt/v4/log.Logger`.** The migrator logs through eGo's own logging seam, so a single `ego.Logger` implementation now covers the engine and the migrator instead of one per backend. Existing calls that passed a GoAkt logger no longer compile:
+
+  ```go
+  migration.WithLogger(myEgoLogger)
+  ```
+
+  The default also changes from `log.DefaultLogger` (zap to stdout) to `ego.DefaultLogger` (`log/slog`). Rendered message text is unchanged.
+
 ## [v4.4.3] - 2026-08-15
 
 ### 💥 Breaking Changes
