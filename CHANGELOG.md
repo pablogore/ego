@@ -44,6 +44,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   The adapter previously discarded every context the engine supplied. A `Logger` that does not implement it keeps using the context-free methods; no context is ever fabricated to fill the gap.
 
+- **`ego.FieldLogger` and `ego.WithFields` build component-tagged loggers.** A `Logger` that implements `FieldLogger` has its own child loggers used by the engine instead of the adapter replaying accumulated fields on every record, and the new helper works whatever the backend supports:
+
+  ```go
+  logger := ego.WithFields(cfg.Logger, "component", "projection")
+  ```
+
+  `WithFields` uses the native child logger when one is available and otherwise wraps the logger, forwarding its `EnabledLogger`, `LeveledLogger` and `ContextLogger` behaviour so tagging fields never downgrades level gating or context propagation.
+
 - **`DiscardLogger` now reports every level as disabled**, so the engine skips message formatting entirely for it, and **`DefaultLogger` answers level checks from `slog.Default()` on every call**, so gating tracks `slog.SetDefault` instead of a snapshot taken when the engine was configured.
 
 ### 🐛 Bug Fixes

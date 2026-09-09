@@ -811,6 +811,152 @@ func TestPlainLoggerFallsBackToNonContextPath(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// Capability interfaces — component loggers (D3)
+// -----------------------------------------------------------------------------
+
+// nativeFieldLogger implements Logger and FieldLogger with real child-logger
+// support: With returns a new logger that merges its own fields, and every
+// record lands on a sink shared with its children.
+type nativeFieldLogger struct {
+	sink      *spyLogger
+	own       []any
+	withCalls *int
+}
+
+func newNativeFieldLogger() *nativeFieldLogger {
+	return &nativeFieldLogger{sink: &spyLogger{}, withCalls: new(int)}
+}
+
+func (n *nativeFieldLogger) merge(args []any) []any {
+	if len(n.own) == 0 {
+		return args
+	}
+	return append(append([]any{}, n.own...), args...)
+}
+
+func (n *nativeFieldLogger) Debug(msg string, args ...any) { n.sink.Debug(msg, n.merge(args)...) }
+func (n *nativeFieldLogger) Info(msg string, args ...any)  { n.sink.Info(msg, n.merge(args)...) }
+func (n *nativeFieldLogger) Warn(msg string, args ...any)  { n.sink.Warn(msg, n.merge(args)...) }
+func (n *nativeFieldLogger) Error(msg string, args ...any) { n.sink.Error(msg, n.merge(args)...) }
+
+func (n *nativeFieldLogger) With(args ...any) Logger {
+	*n.withCalls++
+	return &nativeFieldLogger{sink: n.sink, own: n.merge(args), withCalls: n.withCalls}
+}
+
+func TestLoggerAdapterWithUsesFieldLogger(t *testing.T) {
+	native := newNativeFieldLogger()
+	a := newLoggerAdapter(native)
+
+	child := a.With("component", "runtime")
+	require.Equal(t, 1, *native.withCalls, "the backend's native child logger must be used")
+
+	child.Info("started")
+	assert.Equal(t, "info", native.sink.lastMethod)
+	assert.Equal(t, "started", native.sink.lastMsg)
+	assert.Equal(t, []any{"component", "runtime"}, native.sink.lastFields)
+	assert.Empty(t, child.(*loggerAdapter).fields,
+		"the adapter must not also accumulate fields the backend already carries")
+
+	child.With("tenant", "t1").Info("nested")
+	assert.Equal(t, 2, *native.withCalls)
+	assert.Equal(t, []any{"component", "runtime", "tenant", "t1"}, native.sink.lastFields)
+}
+
+func TestWithFields(t *testing.T) {
+	t.Run("empty args returns the same logger", func(t *testing.T) {
+		spy := &spyLogger{}
+		assert.Same(t, spy, WithFields(spy))
+	})
+
+	t.Run("nil logger yields DiscardLogger", func(t *testing.T) {
+		var typedNil *spyLogger
+		assert.Equal(t, DiscardLogger, WithFields(nil, "k", "v"))
+		assert.Equal(t, DiscardLogger, WithFields(typedNil, "k", "v"))
+	})
+
+	t.Run("uses native child logger when FieldLogger is implemented", func(t *testing.T) {
+		native := newNativeFieldLogger()
+		child := WithFields(native, "component", "projection")
+		require.Equal(t, 1, *native.withCalls)
+		assert.IsType(t, &nativeFieldLogger{}, child)
+
+		child.Warn("lagging", "offset", 7)
+		assert.Equal(t, "warn", native.sink.lastMethod)
+		assert.Equal(t, []any{"component", "projection", "offset", 7}, native.sink.lastFields)
+	})
+
+	t.Run("wrapper prepends fields for a plain logger", func(t *testing.T) {
+		spy := &spyLogger{}
+		child := WithFields(spy, "component", "engine")
+		assert.NotSame(t, spy, child)
+
+		child.Error("boom", "err", "nope")
+		assert.Equal(t, "error", spy.lastMethod)
+		assert.Equal(t, "boom", spy.lastMsg)
+		assert.Equal(t, []any{"component", "engine", "err", "nope"}, spy.lastFields)
+
+		child.Debug("plain")
+		assert.Equal(t, []any{"component", "engine"}, spy.lastFields)
+	})
+
+	t.Run("wrapper honors the wrapped EnabledLogger", func(t *testing.T) {
+		inner := &enabledSpyLogger{min: slog.LevelWarn}
+		child := WithFields(inner, "component", "engine")
+
+		el, ok := child.(EnabledLogger)
+		require.True(t, ok, "wrapping must not drop EnabledLogger")
+		assert.False(t, el.Enabled(context.Background(), slog.LevelDebug))
+		assert.True(t, el.Enabled(context.Background(), slog.LevelError))
+
+		// The same must hold through the adapter, which is what gates GoAkt.
+		a := newLoggerAdapter(child)
+		assert.False(t, a.Enabled(log.DebugLevel))
+		assert.True(t, a.Enabled(log.ErrorLevel))
+	})
+
+	t.Run("wrapper honors the wrapped LeveledLogger", func(t *testing.T) {
+		child := WithFields(&leveledSpyLogger{level: levelError}, "component", "engine")
+
+		ll, ok := child.(LeveledLogger)
+		require.True(t, ok, "wrapping must not drop LeveledLogger")
+		assert.Equal(t, levelError, ll.Level())
+
+		a := newLoggerAdapter(child)
+		assert.False(t, a.Enabled(log.DebugLevel))
+		assert.True(t, a.Enabled(log.ErrorLevel))
+	})
+
+	t.Run("wrapper honors the wrapped ContextLogger", func(t *testing.T) {
+		ctx := context.WithValue(context.Background(), ctxKey{}, "trace-1")
+		inner := &ctxSpyLogger{}
+		child := WithFields(inner, "component", "engine")
+
+		newLoggerAdapter(child).InfoContext(ctx, "started", "k", "v")
+
+		require.Equal(t, 1, inner.ctxCalls, "wrapping must not drop context propagation")
+		assert.Equal(t, ctx, inner.lastCtx)
+		assert.Equal(t, "started", inner.lastMsg)
+		assert.Equal(t, []any{"component", "engine", "k", "v"}, inner.lastFields)
+	})
+
+	t.Run("wrapper stays permissive for a plain logger", func(t *testing.T) {
+		child := WithFields(&spyLogger{}, "component", "engine")
+		el, ok := child.(EnabledLogger)
+		require.True(t, ok)
+		assert.True(t, el.Enabled(context.Background(), slog.LevelDebug))
+		assert.Equal(t, levelDebug, child.(LeveledLogger).Level())
+		assert.True(t, newLoggerAdapter(child).Enabled(log.DebugLevel))
+	})
+
+	t.Run("chained calls flatten onto the same logger", func(t *testing.T) {
+		spy := &spyLogger{}
+		WithFields(WithFields(spy, "a", 1), "b", 2).Info("msg", "c", 3)
+		assert.Equal(t, []any{"a", 1, "b", 2, "c", 3}, spy.lastFields)
+	})
+}
+
+// -----------------------------------------------------------------------------
 // Benchmarks — a disabled level must not pay for message formatting
 // -----------------------------------------------------------------------------
 

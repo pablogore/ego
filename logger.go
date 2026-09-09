@@ -96,6 +96,14 @@ type ContextLogger interface {
 	ErrorContext(ctx context.Context, msg string, args ...any)
 }
 
+// FieldLogger is an optional interface that a Logger can implement to return a
+// child logger carrying additional structured fields. When the inner Logger
+// implements it, child loggers are built natively by the backend instead of
+// having fields accumulated and replayed by the adapter.
+type FieldLogger interface {
+	With(args ...any) Logger
+}
+
 // discardLogger is a Logger that silently discards all log output.
 type discardLogger struct{}
 
@@ -144,6 +152,7 @@ type loggerAdapter struct {
 	enabled EnabledLogger
 	leveled LeveledLogger
 	ctxLog  ContextLogger
+	fielder FieldLogger
 
 	fields []any // accumulated key-value pairs from With()
 }
@@ -158,6 +167,7 @@ func newLoggerAdapter(inner Logger) *loggerAdapter {
 	a.enabled, _ = inner.(EnabledLogger)
 	a.leveled, _ = inner.(LeveledLogger)
 	a.ctxLog, _ = inner.(ContextLogger)
+	a.fielder, _ = inner.(FieldLogger)
 	return a
 }
 
@@ -456,10 +466,16 @@ func (a *loggerAdapter) Enabled(l log.Level) bool {
 	return a.enabledAt(context.Background(), l)
 }
 
-// With returns a child logger carrying the given key-value pairs.
+// With returns a child logger carrying the given key-value pairs. When the
+// inner Logger implements FieldLogger the child is built natively by the
+// backend, so a logger with real child-logger support is used instead of the
+// adapter replaying accumulated fields on every record.
 func (a *loggerAdapter) With(keyValues ...any) log.Logger {
 	if len(keyValues) == 0 {
 		return a
+	}
+	if a.fielder != nil {
+		return newLoggerAdapter(a.fielder.With(keyValues...))
 	}
 	child := newLoggerAdapter(a.inner)
 	child.fields = make([]any, 0, len(a.fields)+len(keyValues))
@@ -481,4 +497,117 @@ type loggerWriter struct {
 func (w *loggerWriter) Write(p []byte) (int, error) {
 	w.inner.Info(strings.TrimRight(string(p), "\r\n"))
 	return len(p), nil
+}
+
+// WithFields returns a Logger that adds the given key-value pairs to every
+// record it writes. It uses the Logger's native child-logger support when
+// available (FieldLogger) and otherwise wraps it, so a caller can build a
+// component-tagged logger without knowing which capabilities the backend has.
+//
+// The returned Logger forwards EnabledLogger, LeveledLogger and ContextLogger
+// behaviour of the wrapped Logger, so tagging fields never silently downgrades
+// level gating or context propagation. A nil or typed-nil Logger yields
+// DiscardLogger rather than a wrapper that panics on first use.
+func WithFields(logger Logger, args ...any) Logger {
+	if isNilLogger(logger) {
+		return DiscardLogger
+	}
+	if len(args) == 0 {
+		return logger
+	}
+	if fl, ok := logger.(FieldLogger); ok {
+		return fl.With(args...)
+	}
+	return &fieldsLogger{inner: logger, fields: args}
+}
+
+// fieldsLogger is the fallback used by WithFields for a Logger without native
+// child-logger support. It prepends its own fields to every record and mirrors
+// the wrapped Logger's optional capabilities.
+type fieldsLogger struct {
+	inner  Logger
+	fields []any
+}
+
+var (
+	_ Logger        = (*fieldsLogger)(nil)
+	_ EnabledLogger = (*fieldsLogger)(nil)
+	_ LeveledLogger = (*fieldsLogger)(nil)
+	_ ContextLogger = (*fieldsLogger)(nil)
+	_ FieldLogger   = (*fieldsLogger)(nil)
+)
+
+// prepend returns this logger's fields followed by the record's own fields.
+func (f *fieldsLogger) prepend(args []any) []any {
+	if len(args) == 0 {
+		return f.fields
+	}
+	merged := make([]any, 0, len(f.fields)+len(args))
+	merged = append(merged, f.fields...)
+	merged = append(merged, args...)
+	return merged
+}
+
+func (f *fieldsLogger) Debug(msg string, args ...any) { f.inner.Debug(msg, f.prepend(args)...) }
+func (f *fieldsLogger) Info(msg string, args ...any)  { f.inner.Info(msg, f.prepend(args)...) }
+func (f *fieldsLogger) Warn(msg string, args ...any)  { f.inner.Warn(msg, f.prepend(args)...) }
+func (f *fieldsLogger) Error(msg string, args ...any) { f.inner.Error(msg, f.prepend(args)...) }
+
+// Enabled defers to the wrapped Logger's own capability, in the same
+// precedence order the adapter uses, and stays permissive when it declares
+// neither.
+func (f *fieldsLogger) Enabled(ctx context.Context, level slog.Level) bool {
+	if el, ok := f.inner.(EnabledLogger); ok {
+		return el.Enabled(ctx, level)
+	}
+	if ll, ok := f.inner.(LeveledLogger); ok {
+		return level >= goaktToSlogLevel(parseLevel(ll.Level()))
+	}
+	return true
+}
+
+// Level reports the wrapped Logger's level, or "debug" when it declares none.
+func (f *fieldsLogger) Level() string {
+	if ll, ok := f.inner.(LeveledLogger); ok {
+		return ll.Level()
+	}
+	return levelDebug
+}
+
+func (f *fieldsLogger) DebugContext(ctx context.Context, msg string, args ...any) {
+	if cl, ok := f.inner.(ContextLogger); ok {
+		cl.DebugContext(ctx, msg, f.prepend(args)...)
+		return
+	}
+	f.Debug(msg, args...)
+}
+func (f *fieldsLogger) InfoContext(ctx context.Context, msg string, args ...any) {
+	if cl, ok := f.inner.(ContextLogger); ok {
+		cl.InfoContext(ctx, msg, f.prepend(args)...)
+		return
+	}
+	f.Info(msg, args...)
+}
+func (f *fieldsLogger) WarnContext(ctx context.Context, msg string, args ...any) {
+	if cl, ok := f.inner.(ContextLogger); ok {
+		cl.WarnContext(ctx, msg, f.prepend(args)...)
+		return
+	}
+	f.Warn(msg, args...)
+}
+func (f *fieldsLogger) ErrorContext(ctx context.Context, msg string, args ...any) {
+	if cl, ok := f.inner.(ContextLogger); ok {
+		cl.ErrorContext(ctx, msg, f.prepend(args)...)
+		return
+	}
+	f.Error(msg, args...)
+}
+
+// With flattens chained WithFields calls onto the same wrapped Logger instead
+// of nesting wrappers.
+func (f *fieldsLogger) With(args ...any) Logger {
+	if len(args) == 0 {
+		return f
+	}
+	return &fieldsLogger{inner: f.inner, fields: f.prepend(args)}
 }
