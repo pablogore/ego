@@ -50,7 +50,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   logger := ego.WithFields(cfg.Logger, "component", "projection")
   ```
 
-  `WithFields` uses the native child logger when one is available and otherwise wraps the logger, forwarding its `EnabledLogger`, `LeveledLogger` and `ContextLogger` behaviour so tagging fields never downgrades level gating or context propagation.
+  `WithFields` uses the native child logger when one is available and otherwise wraps the logger. The wrapper reports only the capabilities it genuinely owns — `Logger` and `FieldLogger` — so `_, ok := logger.(ContextLogger)` keeps answering whether the *backend* understands context rather than reporting `true` merely because something wrapped it:
+
+  ```go
+  wrapped := ego.WithFields(plainLogger, "component", "projection")
+  _, ok := wrapped.(ego.ContextLogger) // false — the backend has no context support
+  ```
+
+  Tagging fields still never downgrades level gating or context propagation: the engine resolves `EnabledLogger`, `LeveledLogger` and `ContextLogger` on the wrapped logger through an unexported unwrap protocol, and replays the wrapper's own fields when it routes there, so every record carries them exactly once.
 
 - **`DiscardLogger` now reports every level as disabled**, so the engine skips message formatting entirely for it, and **`DefaultLogger` answers level checks from `slog.Default()` on every call**, so gating tracks `slog.SetDefault` instead of a snapshot taken when the engine was configured.
 
