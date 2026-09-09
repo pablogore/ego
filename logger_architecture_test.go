@@ -33,12 +33,39 @@ import (
 )
 
 // bannedLoggerConstructs are logging constructs first-party production code
-// must not contain. eGo exposes its own Logger seam (ego.Logger), so every
-// default must be derived from that seam instead of hardcoding a concrete
-// third-party backend the caller cannot replace.
+// must not contain anywhere. eGo exposes its own Logger seam (ego.Logger), so
+// every default must be derived from that seam instead of hardcoding a
+// concrete third-party backend the caller cannot replace.
 var bannedLoggerConstructs = []string{
 	"log.NewZap(",
 	"go.uber.org/zap",
+	"log.DefaultLogger",
+	"log.DiscardLogger",
+}
+
+// loggerSeamFile is the one first-party file allowed to name a concrete
+// logging backend. It *is* the seam: DefaultLogger and the GoAkt adapter are
+// defined there, so the constructs below are its job, not a leak.
+const loggerSeamFile = "logger.go"
+
+// bannedOutsideLoggerSeam are logging constructs allowed only in the seam
+// file. Everywhere else they are a parallel backend: a log record that no
+// longer honours the caller's Logger, its level, or its fields.
+//
+// The scan is a substring match, so an entry has to be written the way it
+// appears in source. "log.New(" deliberately also matches "slog.New(" and
+// "golog.New(": constructing any of those outside the seam is the same defect.
+var bannedOutsideLoggerSeam = []string{
+	"slog.Debug(",
+	"slog.Info(",
+	"slog.Warn(",
+	"slog.Error(",
+	"slog.Default(",
+	"log.New(",
+	"log.Printf(",
+	"log.Println(",
+	"fmt.Printf(",
+	"fmt.Println(",
 }
 
 // loggerArchitectureSkippedDirs are directories excluded from the scan.
@@ -73,11 +100,12 @@ func isScannedGoSource(path string) bool {
 	}
 }
 
-// TestNoHardcodedZapLoggerInFirstPartyCode guards the logging boundary: no
-// first-party production file may construct a concrete zap logger, because the
-// only supported way to choose a backend is to implement ego.Logger and pass it
-// through WithLogger.
-func TestNoHardcodedZapLoggerInFirstPartyCode(t *testing.T) {
+// TestNoParallelLoggingBackendInFirstPartyCode guards the logging boundary. No
+// first-party production file may construct a concrete backend, and none but
+// the seam file itself may write a record outside the ego.Logger it was given,
+// because the only supported way to choose a backend is to implement
+// ego.Logger and pass it through WithLogger.
+func TestNoParallelLoggingBackendInFirstPartyCode(t *testing.T) {
 	root, err := os.Getwd()
 	require.NoError(t, err)
 
@@ -113,6 +141,15 @@ func TestNoHardcodedZapLoggerInFirstPartyCode(t *testing.T) {
 			// the offending path and construct instead of dumping the source.
 			require.Falsef(t, strings.Contains(string(content), banned),
 				"%s must not use %q: derive the default from ego.Logger instead", rel, banned)
+		}
+
+		if rel == loggerSeamFile {
+			return nil
+		}
+		for _, banned := range bannedOutsideLoggerSeam {
+			require.Falsef(t, strings.Contains(string(content), banned),
+				"%s must not use %q: log through the ego.Logger it was given, not a parallel backend",
+				rel, banned)
 		}
 		return nil
 	})
