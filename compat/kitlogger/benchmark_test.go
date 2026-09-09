@@ -155,6 +155,38 @@ func BenchmarkWithThenLog(b *testing.B) {
 	})
 }
 
+// BenchmarkAdapterOverhead isolates what this package costs, by comparing a
+// raw kit-logger — which satisfies ego.Logger on its own — against the same
+// logger behind the Adapter. Any difference here is the adapter's; a difference
+// against the "direct" arm of the benchmarks above is kit-logger's own.
+func BenchmarkAdapterOverhead(b *testing.B) {
+	run := func(b *testing.B, level slog.Level, fn func(*testing.B, ego.Logger)) {
+		backend := func() kitlogger.Logger {
+			return kitlogger.New(kitlogger.Config{Handler: discardHandler(level)})
+		}
+		b.Run("raw", func(b *testing.B) { fn(b, backend()) })
+		b.Run("adapted", func(b *testing.B) { fn(b, egokit.New(backend())) })
+	}
+
+	b.Run("Disabled", func(b *testing.B) {
+		run(b, slog.LevelInfo, func(b *testing.B, logger ego.Logger) {
+			b.ReportAllocs()
+			for b.Loop() {
+				logger.Debug("a discarded record", "entity_id", "abc-123")
+			}
+		})
+	})
+
+	b.Run("EnabledStructured", func(b *testing.B) {
+		run(b, slog.LevelDebug, func(b *testing.B, logger ego.Logger) {
+			b.ReportAllocs()
+			for b.Loop() {
+				logger.Info("entity spawned", "entity_id", "abc-123", "shards", 8)
+			}
+		})
+	})
+}
+
 // BenchmarkGoAktDebugfDisabled mirrors the root module's benchmark of the same
 // name, so the cost the kit-logger backend adds to GoAkt's hottest gated path
 // can be compared directly.
