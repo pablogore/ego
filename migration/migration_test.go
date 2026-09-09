@@ -385,6 +385,52 @@ func TestMigratorOptions(t *testing.T) {
 		assert.EqualValues(t, 500, m.pageSize)
 		assert.NotNil(t, m.logger)
 	})
+
+	t.Run("WithLogger(nil) falls back to the default logger", func(t *testing.T) {
+		m := New(nil, nil, WithLogger(nil))
+		assert.Equal(t, ego.DefaultLogger, m.logger)
+	})
+
+	t.Run("WithLogger with a typed-nil logger falls back to the default logger", func(t *testing.T) {
+		var typedNil *recordingLogger
+		m := New(nil, nil, WithLogger(typedNil))
+		assert.Equal(t, ego.DefaultLogger, m.logger)
+	})
+}
+
+func TestMigratorRunWithNilLogger(t *testing.T) {
+	tests := []struct {
+		name   string
+		logger ego.Logger
+	}{
+		{"untyped nil", nil},
+		{"typed nil", (*recordingLogger)(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			eventStore := testkit.NewEventsStore()
+			require.NoError(t, eventStore.Connect(ctx))
+
+			snapshotStore := testkit.NewSnapshotStore()
+			require.NoError(t, snapshotStore.Connect(ctx))
+
+			stateAny, err := anypb.New(&timestamppb.Timestamp{Seconds: 7})
+			require.NoError(t, err)
+			eventAny, err := anypb.New(timestamppb.Now())
+			require.NoError(t, err)
+			writeLegacyEvent(t, eventStore, "nil-logger-1", 1, eventAny, stateAny, 1, 0)
+
+			migrator := New(eventStore, snapshotStore, WithLogger(tt.logger))
+			require.NotPanics(t, func() {
+				require.NoError(t, migrator.Run(ctx))
+			})
+
+			require.NoError(t, eventStore.Disconnect(ctx))
+			require.NoError(t, snapshotStore.Disconnect(ctx))
+		})
+	}
 }
 
 // recordingLogger implements ego.Logger and records every message it receives,
