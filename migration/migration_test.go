@@ -24,15 +24,16 @@ package migration
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tochemey/goakt/v4/log"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	ego "github.com/tochemey/ego/v4"
 	"github.com/tochemey/ego/v4/egopb"
 	"github.com/tochemey/ego/v4/testkit"
 )
@@ -130,7 +131,7 @@ func TestMigratorRun(t *testing.T) {
 		// Run migration
 		migrator := New(eventStore, snapshotStore,
 			WithPageSize(10),
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 		require.NoError(t, migrator.Run(ctx))
 
@@ -170,7 +171,7 @@ func TestMigratorRun(t *testing.T) {
 
 		migrator := New(eventStore, snapshotStore,
 			WithPageSize(10),
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 		require.NoError(t, migrator.Run(ctx))
 
@@ -202,7 +203,7 @@ func TestMigratorRun(t *testing.T) {
 
 		migrator := New(eventStore, snapshotStore,
 			WithPageSize(2),
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 		require.NoError(t, migrator.Run(ctx))
 
@@ -236,7 +237,7 @@ func TestMigratorRun(t *testing.T) {
 
 		migrator := New(eventStore, snapshotStore,
 			WithPageSize(10),
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 
 		// Run twice
@@ -262,7 +263,7 @@ func TestMigratorRun(t *testing.T) {
 		require.NoError(t, snapshotStore.Connect(ctx))
 
 		migrator := New(eventStore, snapshotStore,
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 		// Ping will auto-connect the testkit store, so this will actually succeed.
 		// That's fine — testkit stores auto-connect on Ping.
@@ -282,7 +283,7 @@ func TestMigratorRun(t *testing.T) {
 		require.NoError(t, snapshotStore.Connect(ctx))
 
 		migrator := New(eventStore, snapshotStore,
-			WithLogger(log.DiscardLogger),
+			WithLogger(ego.DiscardLogger),
 		)
 		require.NoError(t, migrator.Run(ctx))
 
@@ -374,7 +375,7 @@ func TestMigratorOptions(t *testing.T) {
 	})
 
 	t.Run("WithLogger", func(t *testing.T) {
-		logger := log.DiscardLogger
+		logger := ego.DiscardLogger
 		m := New(nil, nil, WithLogger(logger))
 		assert.Equal(t, logger, m.logger)
 	})
@@ -383,5 +384,81 @@ func TestMigratorOptions(t *testing.T) {
 		m := New(nil, nil)
 		assert.EqualValues(t, 500, m.pageSize)
 		assert.NotNil(t, m.logger)
+	})
+}
+
+// recordingLogger implements ego.Logger and records every message it receives,
+// so a test can prove a caller-supplied logger really reaches the Migrator's
+// logging call sites.
+type recordingLogger struct {
+	mu       sync.Mutex
+	debugMsg []string
+	infoMsg  []string
+}
+
+func (r *recordingLogger) Debug(msg string, _ ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.debugMsg = append(r.debugMsg, msg)
+}
+
+func (r *recordingLogger) Info(msg string, _ ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.infoMsg = append(r.infoMsg, msg)
+}
+
+func (r *recordingLogger) Warn(string, ...any)  {}
+func (r *recordingLogger) Error(string, ...any) {}
+
+func (r *recordingLogger) infos() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.infoMsg...)
+}
+
+func (r *recordingLogger) debugs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.debugMsg...)
+}
+
+// compile-time check that the fake satisfies the public logging seam.
+var _ ego.Logger = (*recordingLogger)(nil)
+
+func TestMigratorUsesEgoLogger(t *testing.T) {
+	t.Run("defaults to ego.DefaultLogger", func(t *testing.T) {
+		m := New(nil, nil)
+		assert.Equal(t, ego.DefaultLogger, m.logger)
+	})
+
+	t.Run("WithLogger injects a custom ego.Logger", func(t *testing.T) {
+		logger := &recordingLogger{}
+		m := New(nil, nil, WithLogger(logger))
+		assert.Same(t, logger, m.logger)
+	})
+
+	t.Run("the injected logger receives the migration messages", func(t *testing.T) {
+		ctx := context.Background()
+
+		eventStore := testkit.NewEventsStore()
+		require.NoError(t, eventStore.Connect(ctx))
+
+		snapshotStore := testkit.NewSnapshotStore()
+		require.NoError(t, snapshotStore.Connect(ctx))
+
+		stateAny, err := anypb.New(timestamppb.Now())
+		require.NoError(t, err)
+		eventAny, err := anypb.New(timestamppb.Now())
+		require.NoError(t, err)
+
+		writeLegacyEvent(t, eventStore, "entity-1", 1, eventAny, stateAny, 100, 0)
+
+		logger := &recordingLogger{}
+		migrator := New(eventStore, snapshotStore, WithLogger(logger))
+		require.NoError(t, migrator.Run(ctx))
+
+		assert.Contains(t, logger.infos(), "migration: completed successfully, processed 1 entities")
+		assert.Contains(t, logger.debugs(), "migration: entity entity-1 snapshot written at sequence 1")
 	})
 }
