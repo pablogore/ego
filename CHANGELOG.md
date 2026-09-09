@@ -16,6 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   The default also changes from `log.DefaultLogger` (zap to stdout) to `ego.DefaultLogger` (`log/slog`). Rendered message text is unchanged.
 
+- **`kafka.Config.Logger` now takes `ego.Logger` instead of `github.com/tochemey/goakt/v4/log.Logger`.** The field was never read anywhere in the `publisher/kafka` module, so nothing changes at runtime, but code that assigned a GoAkt logger to it no longer compiles:
+
+  ```go
+  cfg := &kafka.Config{Logger: myEgoLogger}
+  ```
+
 ## [v4.4.3] - 2026-08-15
 
 ### 💥 Breaking Changes
