@@ -34,6 +34,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   The signature mirrors `log/slog`'s own `Handler.Enabled`, so any slog-backed logger satisfies it trivially and gating costs no string formatting on the hot path. `LeveledLogger` keeps working unchanged and is used when `EnabledLogger` is absent.
 
+- **`ego.ContextLogger` lets a Logger receive the `context.Context` of a log call.** A `Logger` that implements it is handed the engine's own context verbatim, so a backend can enrich records from it:
+
+  ```go
+  func (l *myLogger) InfoContext(ctx context.Context, msg string, args ...any) {
+      l.handler.Handle(ctx, record(msg, args))
+  }
+  ```
+
+  The adapter previously discarded every context the engine supplied. A `Logger` that does not implement it keeps using the context-free methods; no context is ever fabricated to fill the gap.
+
 - **`DiscardLogger` now reports every level as disabled**, so the engine skips message formatting entirely for it, and **`DefaultLogger` answers level checks from `slog.Default()` on every call**, so gating tracks `slog.SetDefault` instead of a snapshot taken when the engine was configured.
 
 ### 🐛 Bug Fixes

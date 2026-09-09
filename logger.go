@@ -84,6 +84,18 @@ type EnabledLogger interface {
 	Enabled(ctx context.Context, level slog.Level) bool
 }
 
+// ContextLogger is an optional interface that a Logger can implement to receive
+// the context.Context associated with a log call. When the inner Logger
+// implements it, the adapter forwards the caller's context verbatim; otherwise
+// it falls back to the context-free methods. The adapter never fabricates a
+// context to fill the gap.
+type ContextLogger interface {
+	DebugContext(ctx context.Context, msg string, args ...any)
+	InfoContext(ctx context.Context, msg string, args ...any)
+	WarnContext(ctx context.Context, msg string, args ...any)
+	ErrorContext(ctx context.Context, msg string, args ...any)
+}
+
 // discardLogger is a Logger that silently discards all log output.
 type discardLogger struct{}
 
@@ -131,6 +143,7 @@ type loggerAdapter struct {
 	// report never is.
 	enabled EnabledLogger
 	leveled LeveledLogger
+	ctxLog  ContextLogger
 
 	fields []any // accumulated key-value pairs from With()
 }
@@ -144,6 +157,7 @@ func newLoggerAdapter(inner Logger) *loggerAdapter {
 	a := &loggerAdapter{inner: inner}
 	a.enabled, _ = inner.(EnabledLogger)
 	a.leveled, _ = inner.(LeveledLogger)
+	a.ctxLog, _ = inner.(ContextLogger)
 	return a
 }
 
@@ -308,6 +322,27 @@ func (a *loggerAdapter) route(level log.Level, msg string, fields []any) {
 	}
 }
 
+// routeContext sends one record together with the caller's context. It is used
+// only on paths where GoAkt actually supplied a context: when the inner Logger
+// implements ContextLogger the context is forwarded verbatim, otherwise the
+// context-free method is used rather than dropping the record.
+func (a *loggerAdapter) routeContext(ctx context.Context, level log.Level, msg string, fields []any) {
+	if a.ctxLog == nil {
+		a.route(level, msg, fields)
+		return
+	}
+	switch level {
+	case log.DebugLevel:
+		a.ctxLog.DebugContext(ctx, msg, fields...)
+	case log.WarningLevel:
+		a.ctxLog.WarnContext(ctx, msg, fields...)
+	case log.ErrorLevel:
+		a.ctxLog.ErrorContext(ctx, msg, fields...)
+	default:
+		a.ctxLog.InfoContext(ctx, msg, fields...)
+	}
+}
+
 // The plain methods do not re-check the level: GoAkt already guards its call
 // sites with Enabled, and the inner Logger applies its own filtering. The
 // formatted methods do check, because the fmt.Sprintf allocation is one this
@@ -323,15 +358,15 @@ func (a *loggerAdapter) Debugf(format string, args ...any) {
 	}
 	a.route(log.DebugLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) DebugContext(_ context.Context, args ...any) {
+func (a *loggerAdapter) DebugContext(ctx context.Context, args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.route(log.DebugLevel, msg, a.mergeFields(fields))
+	a.routeContext(ctx, log.DebugLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) DebugfContext(ctx context.Context, format string, args ...any) {
 	if !a.enabledAt(ctx, log.DebugLevel) {
 		return
 	}
-	a.route(log.DebugLevel, fmt.Sprintf(format, args...), a.fields)
+	a.routeContext(ctx, log.DebugLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Info(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
@@ -343,15 +378,15 @@ func (a *loggerAdapter) Infof(format string, args ...any) {
 	}
 	a.route(log.InfoLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) InfoContext(_ context.Context, args ...any) {
+func (a *loggerAdapter) InfoContext(ctx context.Context, args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.route(log.InfoLevel, msg, a.mergeFields(fields))
+	a.routeContext(ctx, log.InfoLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) InfofContext(ctx context.Context, format string, args ...any) {
 	if !a.enabledAt(ctx, log.InfoLevel) {
 		return
 	}
-	a.route(log.InfoLevel, fmt.Sprintf(format, args...), a.fields)
+	a.routeContext(ctx, log.InfoLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Warn(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
@@ -363,15 +398,15 @@ func (a *loggerAdapter) Warnf(format string, args ...any) {
 	}
 	a.route(log.WarningLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) WarnContext(_ context.Context, args ...any) {
+func (a *loggerAdapter) WarnContext(ctx context.Context, args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.route(log.WarningLevel, msg, a.mergeFields(fields))
+	a.routeContext(ctx, log.WarningLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) WarnfContext(ctx context.Context, format string, args ...any) {
 	if !a.enabledAt(ctx, log.WarningLevel) {
 		return
 	}
-	a.route(log.WarningLevel, fmt.Sprintf(format, args...), a.fields)
+	a.routeContext(ctx, log.WarningLevel, fmt.Sprintf(format, args...), a.fields)
 }
 func (a *loggerAdapter) Error(args ...any) {
 	msg, fields := goaktArgsToMsg(args)
@@ -383,15 +418,15 @@ func (a *loggerAdapter) Errorf(format string, args ...any) {
 	}
 	a.route(log.ErrorLevel, fmt.Sprintf(format, args...), a.fields)
 }
-func (a *loggerAdapter) ErrorContext(_ context.Context, args ...any) {
+func (a *loggerAdapter) ErrorContext(ctx context.Context, args ...any) {
 	msg, fields := goaktArgsToMsg(args)
-	a.route(log.ErrorLevel, msg, a.mergeFields(fields))
+	a.routeContext(ctx, log.ErrorLevel, msg, a.mergeFields(fields))
 }
 func (a *loggerAdapter) ErrorfContext(ctx context.Context, format string, args ...any) {
 	if !a.enabledAt(ctx, log.ErrorLevel) {
 		return
 	}
-	a.route(log.ErrorLevel, fmt.Sprintf(format, args...), a.fields)
+	a.routeContext(ctx, log.ErrorLevel, fmt.Sprintf(format, args...), a.fields)
 }
 
 // LogLevel reports the most verbose level the inner Logger currently accepts.

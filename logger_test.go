@@ -728,6 +728,89 @@ func TestFormattedMethodsSkipFormattingWhenLevelDisabled(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// Capability interfaces — context propagation (D2)
+// -----------------------------------------------------------------------------
+
+// ctxKey is the sentinel key used to prove a context round-trips unchanged.
+type ctxKey struct{}
+
+// ctxSpyLogger implements Logger and ContextLogger, recording the context it
+// received and which context-aware method received it.
+type ctxSpyLogger struct {
+	spyLogger
+	lastCtx   context.Context
+	ctxMethod string
+	ctxCalls  int
+}
+
+func (c *ctxSpyLogger) record(ctx context.Context, method string) {
+	c.lastCtx = ctx
+	c.ctxMethod = method
+	c.ctxCalls++
+}
+
+func (c *ctxSpyLogger) DebugContext(ctx context.Context, msg string, args ...any) {
+	c.record(ctx, "debug")
+	c.Debug(msg, args...)
+}
+func (c *ctxSpyLogger) InfoContext(ctx context.Context, msg string, args ...any) {
+	c.record(ctx, "info")
+	c.Info(msg, args...)
+}
+func (c *ctxSpyLogger) WarnContext(ctx context.Context, msg string, args ...any) {
+	c.record(ctx, "warn")
+	c.Warn(msg, args...)
+}
+func (c *ctxSpyLogger) ErrorContext(ctx context.Context, msg string, args ...any) {
+	c.record(ctx, "error")
+	c.Error(msg, args...)
+}
+
+func TestContextLoggerReceivesCallerContext(t *testing.T) {
+	tests := []struct {
+		name   string
+		call   func(*loggerAdapter, context.Context)
+		method string
+		msg    string
+	}{
+		{"DebugContext", func(a *loggerAdapter, c context.Context) { a.DebugContext(c, "d") }, "debug", "d"},
+		{"DebugfContext", func(a *loggerAdapter, c context.Context) { a.DebugfContext(c, "d%d", 1) }, "debug", "d1"},
+		{"InfoContext", func(a *loggerAdapter, c context.Context) { a.InfoContext(c, "i") }, "info", "i"},
+		{"InfofContext", func(a *loggerAdapter, c context.Context) { a.InfofContext(c, "i%d", 2) }, "info", "i2"},
+		{"WarnContext", func(a *loggerAdapter, c context.Context) { a.WarnContext(c, "w") }, "warn", "w"},
+		{"WarnfContext", func(a *loggerAdapter, c context.Context) { a.WarnfContext(c, "w%d", 3) }, "warn", "w3"},
+		{"ErrorContext", func(a *loggerAdapter, c context.Context) { a.ErrorContext(c, "e") }, "error", "e"},
+		{"ErrorfContext", func(a *loggerAdapter, c context.Context) { a.ErrorfContext(c, "e%d", 4) }, "error", "e4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), ctxKey{}, "trace-1")
+			inner := &ctxSpyLogger{}
+			a := newLoggerAdapter(inner)
+
+			tt.call(a, ctx)
+
+			require.Equal(t, 1, inner.ctxCalls, "the context-aware method must be used")
+			assert.Equal(t, ctx, inner.lastCtx, "the caller's context must be forwarded verbatim")
+			assert.Equal(t, "trace-1", inner.lastCtx.Value(ctxKey{}))
+			assert.Equal(t, tt.method, inner.ctxMethod)
+			assert.Equal(t, tt.msg, inner.lastMsg)
+		})
+	}
+}
+
+func TestPlainLoggerFallsBackToNonContextPath(t *testing.T) {
+	spy := &spyLogger{}
+	a := newLoggerAdapter(spy)
+
+	a.InfoContext(context.WithValue(context.Background(), ctxKey{}, "trace-1"), "hello", "k", "v")
+
+	assert.Equal(t, "info", spy.lastMethod)
+	assert.Equal(t, "hello", spy.lastMsg)
+	assert.Equal(t, []any{"k", "v"}, spy.lastFields)
+}
+
+// -----------------------------------------------------------------------------
 // Benchmarks — a disabled level must not pay for message formatting
 // -----------------------------------------------------------------------------
 
