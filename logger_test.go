@@ -24,6 +24,7 @@ package ego
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -954,6 +955,307 @@ func TestWithFields(t *testing.T) {
 		WithFields(WithFields(spy, "a", 1), "b", 2).Info("msg", "c", 3)
 		assert.Equal(t, []any{"a", 1, "b", 2, "c", 3}, spy.lastFields)
 	})
+}
+
+// -----------------------------------------------------------------------------
+// Capability combination matrix
+//
+// The four dimensions explored below are: context capable / incapable,
+// enabled capable / incapable, backend at debug / at info, and component
+// (field) capable / incapable. Go interface satisfaction is static per type,
+// so each capability lives on its own mixin and the eight combinations are
+// eight one-line embeddings over a shared observable state.
+// -----------------------------------------------------------------------------
+
+// matrixState is the observable state shared by a matrix logger and every
+// child logger derived from it.
+type matrixState struct {
+	spyLogger
+	lastCtx   context.Context
+	ctxCalls  int
+	withCalls int
+}
+
+// matrixCore is one matrix logger: a minimum level plus the fields it carries,
+// writing into a shared matrixState. build rebuilds the same capability
+// combination for child loggers.
+type matrixCore struct {
+	state *matrixState
+	min   slog.Level
+	own   []any
+	build func(*matrixCore) Logger
+}
+
+func (m *matrixCore) merge(args []any) []any {
+	if len(m.own) == 0 {
+		return args
+	}
+	return append(append([]any{}, m.own...), args...)
+}
+
+func (m *matrixCore) enabled(ctx context.Context, level slog.Level) bool {
+	m.state.lastCtx = ctx
+	return level >= m.min
+}
+
+func (m *matrixCore) logContext(ctx context.Context, level slog.Level, msg string, args []any) {
+	m.state.lastCtx = ctx
+	m.state.ctxCalls++
+	switch level {
+	case slog.LevelDebug:
+		m.state.Debug(msg, m.merge(args)...)
+	case slog.LevelWarn:
+		m.state.Warn(msg, m.merge(args)...)
+	case slog.LevelError:
+		m.state.Error(msg, m.merge(args)...)
+	default:
+		m.state.Info(msg, m.merge(args)...)
+	}
+}
+
+func (m *matrixCore) with(args ...any) Logger {
+	m.state.withCalls++
+	return m.build(&matrixCore{state: m.state, min: m.min, own: m.merge(args), build: m.build})
+}
+
+type baseMixin struct{ core *matrixCore }
+
+func (m baseMixin) Debug(msg string, args ...any) { m.core.state.Debug(msg, m.core.merge(args)...) }
+func (m baseMixin) Info(msg string, args ...any)  { m.core.state.Info(msg, m.core.merge(args)...) }
+func (m baseMixin) Warn(msg string, args ...any)  { m.core.state.Warn(msg, m.core.merge(args)...) }
+func (m baseMixin) Error(msg string, args ...any) { m.core.state.Error(msg, m.core.merge(args)...) }
+
+type enabledMixin struct{ core *matrixCore }
+
+func (m enabledMixin) Enabled(ctx context.Context, level slog.Level) bool {
+	return m.core.enabled(ctx, level)
+}
+
+type ctxMixin struct{ core *matrixCore }
+
+func (m ctxMixin) DebugContext(ctx context.Context, msg string, args ...any) {
+	m.core.logContext(ctx, slog.LevelDebug, msg, args)
+}
+func (m ctxMixin) InfoContext(ctx context.Context, msg string, args ...any) {
+	m.core.logContext(ctx, slog.LevelInfo, msg, args)
+}
+func (m ctxMixin) WarnContext(ctx context.Context, msg string, args ...any) {
+	m.core.logContext(ctx, slog.LevelWarn, msg, args)
+}
+func (m ctxMixin) ErrorContext(ctx context.Context, msg string, args ...any) {
+	m.core.logContext(ctx, slog.LevelError, msg, args)
+}
+
+type fieldMixin struct{ core *matrixCore }
+
+func (m fieldMixin) With(args ...any) Logger { return m.core.with(args...) }
+
+// The eight capability combinations. B = base Logger only, E = EnabledLogger,
+// C = ContextLogger, F = FieldLogger.
+type logB struct{ baseMixin }
+type logBE struct {
+	baseMixin
+	enabledMixin
+}
+type logBC struct {
+	baseMixin
+	ctxMixin
+}
+type logBF struct {
+	baseMixin
+	fieldMixin
+}
+type logBEC struct {
+	baseMixin
+	enabledMixin
+	ctxMixin
+}
+type logBEF struct {
+	baseMixin
+	enabledMixin
+	fieldMixin
+}
+type logBCF struct {
+	baseMixin
+	ctxMixin
+	fieldMixin
+}
+type logBECF struct {
+	baseMixin
+	enabledMixin
+	ctxMixin
+	fieldMixin
+}
+
+func matrixBuilder(wantEnabled, wantCtx, wantField bool) func(*matrixCore) Logger {
+	return func(c *matrixCore) Logger {
+		b, e, x, f := baseMixin{c}, enabledMixin{c}, ctxMixin{c}, fieldMixin{c}
+		switch {
+		case wantEnabled && wantCtx && wantField:
+			return logBECF{b, e, x, f}
+		case wantEnabled && wantCtx:
+			return logBEC{b, e, x}
+		case wantEnabled && wantField:
+			return logBEF{b, e, f}
+		case wantCtx && wantField:
+			return logBCF{b, x, f}
+		case wantEnabled:
+			return logBE{b, e}
+		case wantCtx:
+			return logBC{b, x}
+		case wantField:
+			return logBF{b, f}
+		default:
+			return logB{b}
+		}
+	}
+}
+
+func newMatrixLogger(minLevel slog.Level, wantEnabled, wantCtx, wantField bool) (Logger, *matrixState) {
+	state := &matrixState{}
+	build := matrixBuilder(wantEnabled, wantCtx, wantField)
+	return build(&matrixCore{state: state, min: minLevel, build: build}), state
+}
+
+func TestLoggerAdapterCapabilityMatrix(t *testing.T) {
+	backends := []struct {
+		name         string
+		min          slog.Level
+		debugVisible bool
+	}{
+		{name: "backend at debug", min: slog.LevelDebug, debugVisible: true},
+		{name: "backend at info", min: slog.LevelInfo, debugVisible: false},
+	}
+	flags := []bool{false, true}
+
+	for _, backend := range backends {
+		for _, wantEnabled := range flags {
+			for _, wantCtx := range flags {
+				for _, wantField := range flags {
+					name := fmt.Sprintf("%s/enabled=%t/context=%t/component=%t",
+						backend.name, wantEnabled, wantCtx, wantField)
+					t.Run(name, func(t *testing.T) {
+						inner, state := newMatrixLogger(backend.min, wantEnabled, wantCtx, wantField)
+						a := newLoggerAdapter(inner)
+						ctx := context.WithValue(context.Background(), ctxKey{}, "trace-1")
+
+						// A backend that cannot answer level checks is never
+						// gated by the adapter, so DEBUG always reaches it.
+						wantDebug := !wantEnabled || backend.debugVisible
+						assert.Equal(t, wantDebug, a.Enabled(log.DebugLevel))
+
+						// Reproduce GoAkt's own guard around a DEBUG record.
+						if a.Enabled(log.DebugLevel) {
+							a.DebugContext(ctx, "dbg")
+						}
+						if wantDebug {
+							assert.Equal(t, "debug", state.lastMethod)
+							assert.Equal(t, "dbg", state.lastMsg)
+						} else {
+							assert.Empty(t, state.lastMethod,
+								"DEBUG must not reach a backend that disabled it")
+						}
+
+						// INFO is accepted in every configuration.
+						require.True(t, a.Enabled(log.InfoLevel))
+						a.InfoContext(ctx, "started", "k", "v")
+						assert.Equal(t, "info", state.lastMethod)
+						assert.Equal(t, "started", state.lastMsg)
+
+						// The caller's context reaches a context-capable
+						// backend and is never fabricated for an incapable one.
+						if wantCtx {
+							assert.Positive(t, state.ctxCalls)
+							require.NotNil(t, state.lastCtx)
+							assert.Equal(t, "trace-1", state.lastCtx.Value(ctxKey{}))
+						} else {
+							assert.Zero(t, state.ctxCalls)
+						}
+
+						// Component loggers work either way; only the
+						// mechanism differs.
+						a.With("component", "runtime").Info("child")
+						assert.Equal(t, []any{"component", "runtime"}, state.lastFields)
+						if wantField {
+							assert.Equal(t, 1, state.withCalls,
+								"the backend's native child logger must be used")
+						} else {
+							assert.Zero(t, state.withCalls)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Backward compatibility
+// -----------------------------------------------------------------------------
+
+// minimalLogger implements only the four Logger methods — the contract every
+// existing consumer implementation satisfies, with no capability interfaces.
+type minimalLogger struct {
+	records []string
+}
+
+func (m *minimalLogger) Debug(msg string, _ ...any) { m.records = append(m.records, "debug:"+msg) }
+func (m *minimalLogger) Info(msg string, _ ...any)  { m.records = append(m.records, "info:"+msg) }
+func (m *minimalLogger) Warn(msg string, _ ...any)  { m.records = append(m.records, "warn:"+msg) }
+func (m *minimalLogger) Error(msg string, _ ...any) { m.records = append(m.records, "error:"+msg) }
+
+func TestMinimalLoggerRemainsFullySupported(t *testing.T) {
+	inner := &minimalLogger{}
+	var asLogger Logger = inner
+
+	_, isEnabled := asLogger.(EnabledLogger)
+	_, isLeveled := asLogger.(LeveledLogger)
+	_, isCtx := asLogger.(ContextLogger)
+	_, isField := asLogger.(FieldLogger)
+	require.False(t, isEnabled)
+	require.False(t, isLeveled)
+	require.False(t, isCtx)
+	require.False(t, isField)
+
+	a := newLoggerAdapter(asLogger)
+
+	// Nothing is gated away.
+	for _, level := range goaktLevelsByVerbosity {
+		assert.True(t, a.Enabled(level), "level %v", level)
+	}
+
+	ctx := context.Background()
+	a.Debug("d1")
+	a.Debugf("d%d", 2)
+	a.DebugContext(ctx, "d3")
+	a.DebugfContext(ctx, "d%d", 4)
+	a.Info("i1")
+	a.Infof("i%d", 2)
+	a.InfoContext(ctx, "i3")
+	a.InfofContext(ctx, "i%d", 4)
+	a.Warn("w1")
+	a.Warnf("w%d", 2)
+	a.WarnContext(ctx, "w3")
+	a.WarnfContext(ctx, "w%d", 4)
+	a.Error("e1")
+	a.Errorf("e%d", 2)
+	a.ErrorContext(ctx, "e3")
+	a.ErrorfContext(ctx, "e%d", 4)
+
+	assert.Equal(t, []string{
+		"debug:d1", "debug:d2", "debug:d3", "debug:d4",
+		"info:i1", "info:i2", "info:i3", "info:i4",
+		"warn:w1", "warn:w2", "warn:w3", "warn:w4",
+		"error:e1", "error:e2", "error:e3", "error:e4",
+	}, inner.records)
+
+	// Field accumulation still happens in the adapter.
+	a.With("component", "runtime").Info("child")
+	assert.Equal(t, "info:child", inner.records[len(inner.records)-1])
+
+	// And WithFields wraps it without requiring any capability.
+	WithFields(asLogger, "component", "runtime").Info("wrapped")
+	assert.Equal(t, "info:wrapped", inner.records[len(inner.records)-1])
 }
 
 // -----------------------------------------------------------------------------
