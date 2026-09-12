@@ -22,24 +22,45 @@ phases:
     commits: [b0cc5ab, 852c5de, 5014d36, c50d597]
     diff: 310 insertions / 24 deletions across 11 files
     artifact: engram sdd/adopt-kit-logger/apply-progress
-  proposal:
-    status: blocked
-    blocked_reason: >
-      Awaiting a product/architecture decision from the user on kit-logger
-      readiness. Verified defects D1-D7 in exploration.md section 2.4 mean
-      adopting kit-logger as a hard framework dependency today imports a global
-      Prometheus registry mutation (init-time) and an unconditional stdout write
-      into every Ego consumer. Three routes exist; the user must choose.
-  spec:    { status: pending }
-  design:  { status: pending }
-  tasks:   { status: pending }
-  apply:   { status: pending }
-  verify:  { status: pending }
-  archive: { status: pending }
+  decision:
+    status: done
+    date: 2026-09-12
+    decided_by: user
+    summary: >
+      Adopt kit-logger as THE logging API of eGo, replacing the ego.Logger seam
+      entirely (not opt-in). kit-logger main at f602522 (2026-09-12) resolved
+      the blocking defects D1-D7 recorded in exploration.md: Prometheus is
+      opt-in (Config.MetricsHandler), the init-time stdout line is opt-in
+      (Config.LogInitialization), output is configurable (Config.Writer /
+      Config.Sink), Flush/Shutdown are real (ManagedLogger), every log method
+      has a level-disabled fast path, globals are atomic, and an OpenTelemetry
+      correlation decorator ships in pkg/logger/otel. The remaining gap is that
+      ComponentHandler attributes records written through eGo's GoAkt adapter to
+      logger.go rather than to GoAkt's call site (kit-logger captures the PC of
+      the exported method's caller and exposes no way to pass one through).
+  apply:
+    status: done
+    branch: main (working tree)
+    summary: >
+      logger.go rewritten as a thin kitlog.Logger -> GoAkt log.Logger adapter;
+      ego.WithLogger, migration.WithLogger, kafka.Config.Logger take
+      kitlog.Logger; DefaultLogger() returns kitlog.L(); DiscardLogger is a
+      kit-logger with a discard sink; engine, projection runner, saga actor,
+      janitor and snapshot writer log structured records through kit-logger;
+      examples converted; readme and CHANGELOG updated; architecture test now
+      bans GoAkt's log package and the standard library loggers outside
+      logger.go.
+  proposal: { status: superseded, reason: decision recorded above }
+  spec:     { status: superseded }
+  design:   { status: superseded }
+  tasks:    { status: superseded }
+  verify:   { status: pending }
+  archive:  { status: pending }
 
 key_findings:
   - The ego.Logger seam, WithLogger option, DiscardLogger, slog default and the
     GoAkt loggerAdapter already exist and are public since v4.4.3.
+    (Superseded 2026-09-12: the seam was replaced by kit-logger's Logger.)
   - kit-logger.Logger is a strict superset of ego.Logger, so *SlogLogger already
     satisfies ego.Logger with zero adapter code.
   - kit-logger has NO redaction and NO automatic OTel trace correlation, despite

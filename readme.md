@@ -37,6 +37,7 @@ eGo deliberately does not hide the actor runtime. Your application creates and o
 - [Persistence](#persistence)
 - [Encryption and schema evolution](#encryption-and-schema-evolution)
 - [Observability](#observability)
+- [Logging](#logging)
 - [Reliability and operations](#reliability-and-operations)
 - [Testing](#testing)
 - [Examples](#examples)
@@ -233,7 +234,7 @@ Engine-wide options are passed to `ego.NewConfig`:
 - `WithTelemetry` enables OpenTelemetry instrumentation.
 - `WithEncryptor` encrypts persisted event and snapshot payloads.
 - `WithEntityKinds` registers behavior types on every cluster node.
-- `WithLogger` configures logging for eGo and the underlying actor system.
+- `WithLogger` sets the [kit-logger](https://github.com/pablogore/kit-logger) logger used by eGo and the underlying actor system. See [Logging](#logging).
 
 Entity-specific options are passed when an entity is spawned:
 
@@ -522,6 +523,39 @@ cfg := ego.NewConfig(eventsStore,
 
 Instrumentation covers command dispatch and handling, event persistence, active entities and projections, projection processing, offsets, lag, and approximate events behind.
 
+## Logging
+
+eGo logs through [kit-logger](https://github.com/pablogore/kit-logger), a structured logging framework built on `log/slog`. One kit-logger `Logger` covers the whole runtime: the engine, its projection runners, saga actors and publishers, the migrator, and the GoAkt actor system eGo sits on.
+
+```go
+import kitlog "github.com/pablogore/kit-logger/pkg/logger"
+
+logger := kitlog.New(kitlog.Config{
+    Level:        kitlog.LevelInfo,
+    Format:       kitlog.FormatJSON,
+    GlobalFields: map[string]string{"service": "accounts"},
+})
+
+cfg := ego.NewConfig(eventStore, ego.WithLogger(logger))
+```
+
+- When `WithLogger` is not used, eGo logs through `ego.DefaultLogger()`, which is kit-logger's process-wide logger (`logger.L()`). An application that installs its own logger with `logger.SetGlobal` before building the engine therefore needs no extra wiring.
+- `ego.DiscardLogger` drops every record and reports every level as disabled. Use it in tests and benchmarks.
+- `ego.ResolveLogger` applies eGo's nil-logger rule outside the engine: a nil or typed-nil logger resolves to `ego.DefaultLogger()`.
+
+eGo's own records are structured: a fixed message plus snake_case fields such as `persistence_id`, `sequence_number`, `projection`, `saga_id` and `error`. Records written with a context go through kit-logger's `*Context` methods, so enabling kit-logger's OpenTelemetry decorator stamps `trace_id` and `span_id` on them, which joins a log line to the trace `WithTelemetry` produced:
+
+```go
+import kitotel "github.com/pablogore/kit-logger/pkg/logger/otel"
+
+logger := kitlog.New(kitlog.Config{
+    Format:         kitlog.FormatJSON,
+    ContextHandler: kitotel.Decorator(kitotel.Options{}),
+})
+```
+
+Everything else kit-logger offers — level changes at runtime with `SetLevel`, redaction and filtering rules, sampling, rate limiting, buffered output with an explicit `Flush`/`Shutdown` lifecycle — applies to eGo's records unchanged, because eGo never wraps the logger it is given. The application owns the logger's lifecycle; eGo flushes it when the actor system stops but never shuts it down.
+
 ## Reliability and operations
 
 eGo includes several production-focused capabilities:
@@ -530,7 +564,7 @@ eGo includes several production-focused capabilities:
 - Storage cleanup through [retention policies](#snapshots-and-retention)
 - At-rest [encryption](#encryption-and-schema-evolution) for events and snapshots
 - GDPR-style erasure with `Engine.EraseEntity(...)`
-- Pluggable structured logging via `ego.WithLogger(...)`
+- Structured, context-aware [logging](#logging) through kit-logger
 
 ## Testing
 

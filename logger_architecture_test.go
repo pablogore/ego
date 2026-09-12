@@ -32,13 +32,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// loggerSeamFile is the one first-party file allowed to speak GoAkt's logging
+// API: it defines the adapter that presents kit-logger to the actor system.
+const loggerSeamFile = "logger.go"
+
 // bannedLoggerConstructs are logging constructs first-party production code
-// must not contain. eGo exposes its own Logger seam (ego.Logger), so every
-// default must be derived from that seam instead of hardcoding a concrete
-// third-party backend the caller cannot replace.
+// must not contain anywhere. eGo logs through kit-logger, so no default may be
+// derived from a concrete third-party backend the caller cannot replace.
 var bannedLoggerConstructs = []string{
 	"log.NewZap(",
 	"go.uber.org/zap",
+	"log.DefaultLogger",
+	"log.DiscardLogger",
+}
+
+// bannedOutsideLoggerSeam are constructs allowed only in the seam file.
+// Anywhere else they are a parallel logging backend: a record that bypasses
+// the kit-logger Logger the application configured, its level and its fields.
+//
+// The scan is a substring match, so every entry is written the way it appears
+// in source.
+var bannedOutsideLoggerSeam = []string{
+	`"github.com/tochemey/goakt/v4/log"`,
+	"\t\"log\"\n",
+	"slog.New(",
+	"slog.Default(",
+	"slog.SetDefault(",
+	"slog.Debug(",
+	"slog.Info(",
+	"slog.Warn(",
+	"slog.Error(",
+	"log.Printf(",
+	"log.Println(",
+	"log.Fatal",
+	"fmt.Printf(",
+	"fmt.Println(",
 }
 
 // loggerArchitectureSkippedDirs are directories excluded from the scan.
@@ -73,11 +101,12 @@ func isScannedGoSource(path string) bool {
 	}
 }
 
-// TestNoHardcodedZapLoggerInFirstPartyCode guards the logging boundary: no
-// first-party production file may construct a concrete zap logger, because the
-// only supported way to choose a backend is to implement ego.Logger and pass it
-// through WithLogger.
-func TestNoHardcodedZapLoggerInFirstPartyCode(t *testing.T) {
+// TestKitLoggerIsTheOnlyLoggingBackend guards the logging boundary. No
+// first-party production file may construct a concrete third-party logger, and
+// none but the seam file may reach for GoAkt's logging API or the standard
+// library's, because the only supported way to log is through the kit-logger
+// Logger the application passes to WithLogger.
+func TestKitLoggerIsTheOnlyLoggingBackend(t *testing.T) {
 	root, err := os.Getwd()
 	require.NoError(t, err)
 
@@ -112,7 +141,16 @@ func TestNoHardcodedZapLoggerInFirstPartyCode(t *testing.T) {
 			// Assert on a boolean rather than the file body so a failure names
 			// the offending path and construct instead of dumping the source.
 			require.Falsef(t, strings.Contains(string(content), banned),
-				"%s must not use %q: derive the default from ego.Logger instead", rel, banned)
+				"%s must not use %q: log through kit-logger instead", rel, banned)
+		}
+
+		if rel == loggerSeamFile {
+			return nil
+		}
+		for _, banned := range bannedOutsideLoggerSeam {
+			require.Falsef(t, strings.Contains(string(content), banned),
+				"%s must not use %q: log through the kit-logger Logger it was given, not a parallel backend",
+				rel, banned)
 		}
 		return nil
 	})
