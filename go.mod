@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/flowchartsman/retry v1.2.0
 	github.com/google/uuid v1.6.0
-	github.com/pablogore/kit-logger v0.1.2-0.20260912221753-f602522cbc11
+	github.com/pablogore/kit-logger v0.1.2-0.20260912231430-17d1a6eacc85
 	github.com/stretchr/testify v1.12.1
 	github.com/tochemey/goakt/v4 v4.5.4
 	github.com/travisjeffery/go-dynaport v1.0.0

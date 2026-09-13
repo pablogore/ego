@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -412,4 +413,66 @@ func TestGoaktPathReachesKitLogger(t *testing.T) {
 	for _, r := range records {
 		assert.NotEmpty(t, r.msg)
 	}
+}
+
+// sourceOf returns the file and function of the "source" group kit-logger
+// attaches when AddSource is set, or empty strings when the record has none.
+func sourceOf(t *testing.T, r capturedRecord) (file, function string) {
+	t.Helper()
+	group, ok := r.attrs[slog.SourceKey].([]slog.Attr)
+	if !ok {
+		return "", ""
+	}
+	for _, a := range group {
+		switch a.Key {
+		case "file":
+			file = a.Value.String()
+		case "function":
+			function = a.Value.String()
+		}
+	}
+	return file, function
+}
+
+func newSourceCaptureLogger() (kitlog.Logger, *capture) {
+	c := &capture{}
+	logger := kitlog.New(kitlog.Config{
+		Level:     kitlog.LevelDebug,
+		AddSource: true,
+		Sink:      kitlogtest.NewTestHandler(c.add),
+	})
+	return logger, c
+}
+
+func TestLoggerAdapterAttributesRecordsToTheGoaktCallSite(t *testing.T) {
+	logger, sink := newSourceCaptureLogger()
+	adapter := newLoggerAdapter(logger)
+
+	calls := map[string]func(){
+		"Info":         func() { adapter.Info("msg") },
+		"Infof":        func() { adapter.Infof("msg %d", 1) },
+		"ErrorContext": func() { adapter.ErrorContext(context.Background(), "msg") },
+		"With":         func() { adapter.With("k", "v").Warn("msg") },
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			call()
+			file, function := sourceOf(t, sink.last(t))
+			assert.True(t, strings.HasSuffix(file, "logger_test.go"),
+				"the record must name the caller of the adapter, got file %q", file)
+			assert.NotContains(t, function, "loggerAdapter",
+				"the adapter must never be the attributed frame")
+		})
+	}
+}
+
+func TestKitLoggerFromAttributesRecordsToItsDirectCaller(t *testing.T) {
+	logger, sink := newSourceCaptureLogger()
+
+	// eGo's own actors call the recovered backend directly, so no frame must
+	// be skipped for them: a skip would blame whoever called the actor.
+	kitLoggerFrom(newLoggerAdapter(logger)).Error("msg")
+	file, function := sourceOf(t, sink.last(t))
+	assert.True(t, strings.HasSuffix(file, "logger_test.go"), "got file %q", file)
+	assert.Contains(t, function, "TestKitLoggerFromAttributesRecordsToItsDirectCaller")
 }

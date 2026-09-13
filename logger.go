@@ -98,6 +98,15 @@ func ResolveLogger(logger kitlog.Logger) kitlog.Logger {
 // rendering the printf-style variants — after checking the level, so a record
 // nobody will emit is never formatted.
 type loggerAdapter struct {
+	// backend is the kit-logger Logger the application configured, exactly as
+	// it was given. It is what kitLoggerFrom hands back to eGo's own actors,
+	// which call it directly and must be attributed to their own call sites.
+	backend kitlog.Logger
+
+	// inner is backend adjusted for GoAkt's records. Every GoAkt call passes
+	// through one adapter method before reaching kit-logger, so when the
+	// backend supports it, inner skips that frame and a record names the
+	// GoAkt call site instead of this file.
 	inner kitlog.Logger
 
 	// slogger is the backend's own *slog.Logger, resolved once: it answers
@@ -111,8 +120,12 @@ type loggerAdapter struct {
 var _ log.Logger = (*loggerAdapter)(nil)
 
 // newLoggerAdapter wraps a kit-logger Logger for GoAkt.
-func newLoggerAdapter(inner kitlog.Logger) *loggerAdapter {
-	return &loggerAdapter{inner: inner, slogger: inner.Slog()}
+func newLoggerAdapter(backend kitlog.Logger) *loggerAdapter {
+	inner := backend
+	if skipper, ok := backend.(kitlog.CallerSkipper); ok {
+		inner = skipper.WithCallerSkip(1)
+	}
+	return &loggerAdapter{backend: backend, inner: inner, slogger: backend.Slog()}
 }
 
 // kitLoggerFrom recovers the kit-logger Logger behind a GoAkt logger. Every
@@ -123,7 +136,7 @@ func newLoggerAdapter(inner kitlog.Logger) *loggerAdapter {
 // logger is configured.
 func kitLoggerFrom(l log.Logger) kitlog.Logger {
 	if a, ok := l.(*loggerAdapter); ok {
-		return a.inner
+		return a.backend
 	}
 	return DefaultLogger()
 }
@@ -308,7 +321,7 @@ func (a *loggerAdapter) With(keyValues ...any) log.Logger {
 	if len(keyValues) == 0 {
 		return a
 	}
-	return newLoggerAdapter(a.inner.With(keyValues...))
+	return newLoggerAdapter(a.backend.With(keyValues...))
 }
 
 // Flush delivers every record the backend has accepted so far. A buffered
@@ -318,19 +331,19 @@ func (a *loggerAdapter) With(keyValues ...any) log.Logger {
 // hang the actor system's stop. The logger itself is never shut down: the
 // application that built it owns its lifecycle.
 func (a *loggerAdapter) Flush() error {
-	if managed, ok := a.inner.(kitlog.ManagedLogger); ok {
+	if managed, ok := a.backend.(kitlog.ManagedLogger); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), kitlog.DefaultShutdownTimeout)
 		defer cancel()
 		return managed.Flush(ctx)
 	}
-	return a.inner.Sync()
+	return a.backend.Sync()
 }
 
 // StdLogger returns a standard library logger whose every line is written as
 // an INFO record through the backend, so third-party code that only accepts a
 // *log.Logger still lands in the same output as everything else.
 func (a *loggerAdapter) StdLogger() *golog.Logger {
-	return golog.New(&loggerWriter{inner: a.inner}, "", 0)
+	return golog.New(&loggerWriter{inner: a.backend}, "", 0)
 }
 
 // loggerWriter adapts Logger.Info to io.Writer for use with *log.Logger.

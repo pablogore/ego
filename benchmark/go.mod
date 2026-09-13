@@ -38,7 +38,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/miekg/dns v1.1.73 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
-	github.com/pablogore/kit-logger v0.1.2-0.20260912221753-f602522cbc11 // indirect
+	github.com/pablogore/kit-logger v0.1.2-0.20260912231430-17d1a6eacc85 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/reugn/go-quartz v0.15.2 // indirect

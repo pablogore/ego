@@ -34,10 +34,10 @@ phases:
       (Config.LogInitialization), output is configurable (Config.Writer /
       Config.Sink), Flush/Shutdown are real (ManagedLogger), every log method
       has a level-disabled fast path, globals are atomic, and an OpenTelemetry
-      correlation decorator ships in pkg/logger/otel. The remaining gap is that
-      ComponentHandler attributes records written through eGo's GoAkt adapter to
-      logger.go rather than to GoAkt's call site (kit-logger captures the PC of
-      the exported method's caller and exposes no way to pass one through).
+      correlation decorator ships in pkg/logger/otel. kit-logger 17d1a6e (same
+      day) then added CallerSkipper/WithCallerSkip and made call-site
+      attribution opt-in under "source", so eGo's GoAkt adapter skips its own
+      frame and records name GoAkt's real call site; pin bumped accordingly.
   apply:
     status: done
     branch: main (working tree)

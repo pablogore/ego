@@ -554,7 +554,7 @@ logger := kitlog.New(kitlog.Config{
 })
 ```
 
-Everything else kit-logger offers — level changes at runtime with `SetLevel`, redaction and filtering rules, sampling, rate limiting, buffered output with an explicit `Flush`/`Shutdown` lifecycle — applies to eGo's records unchanged, because eGo never wraps the logger it is given. The application owns the logger's lifecycle; eGo flushes it when the actor system stops but never shuts it down.
+Everything else kit-logger offers — level changes at runtime with `SetLevel`, redaction and filtering rules, sampling, rate limiting, `AddSource` call-site attribution, buffered output with an explicit `Flush`/`Shutdown` lifecycle — applies to eGo's records unchanged, because eGo never wraps the logger it is given. Records the actor system writes are attributed to GoAkt's own call site, not to eGo's adapter. The application owns the logger's lifecycle; eGo flushes it when the actor system stops but never shuts it down.
 
 ## Reliability and operations
 
